@@ -28,7 +28,7 @@ def crear_token(data: dict) -> str:
     payload["exp"] = datetime.utcnow() + timedelta(hours=TOKEN_HORAS)
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-def verificar_token(token: str) -> dict | None:
+def verificar_token(token: str):
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError:
