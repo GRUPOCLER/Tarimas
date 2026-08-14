@@ -44,15 +44,14 @@ async def _uid(client: httpx.AsyncClient):
     return uid
 
 async def listar_ovs_pendientes():
-    partner_ids = list(PARTNER_MAP.keys())
     ovs = await _rpc("sale.order", "search_read",
-        [[["partner_id", "in", partner_ids], ["picking_ids", "!=", False], ["state", "in", ["sale", "done"]]]],
-        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order"], "order": "id desc", "limit": 30}
+        [[["picking_ids", "!=", False], ["state", "in", ["sale", "done"]]]],
+        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order"], "order": "id desc", "limit": 60}
     )
     return [{
         "num_ov": ov["name"],
-        "cliente": ov["partner_id"][1],
-        "comercializador": PARTNER_MAP.get(ov["partner_id"][0], ""),
+        "cliente": ov["partner_id"][1] if ov.get("partner_id") else "",
+        "comercializador": PARTNER_MAP.get(ov["partner_id"][0] if ov.get("partner_id") else None, ""),
         "fecha": (ov.get("date_order") or "")[:10],
         "picking_ids": ov["picking_ids"]
     } for ov in ovs]
