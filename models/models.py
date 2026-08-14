@@ -50,16 +50,19 @@ class Entrega(Base):
     productos      = relationship("Producto", back_populates="entrega", cascade="all,delete")
     tarimas        = relationship("Tarima",   back_populates="entrega", cascade="all,delete")
 
-class Producto(Base):
+cclass Producto(Base):
     __tablename__ = "productos"
     id_producto    = Column(String(30), primary_key=True)
     id_entrega     = Column(String(20), ForeignKey("entregas.id_entrega"), nullable=False)
+    id_tarima      = Column(String(30), ForeignKey("tarimas.id_tarima"), nullable=True, index=True)
     clave          = Column(String(40), index=True)
     descripcion    = Column(Text)
     cantidad_total = Column(Integer, default=0)
     unidad         = Column(String(20), default="PZA")
     es_extension   = Column(Boolean, default=False)
+    # Relaciones
     entrega        = relationship("Entrega", back_populates="productos")
+    tarima         = relationship("Tarima", back_populates="productos")
 
 class Tarima(Base):
     __tablename__ = "tarimas"
