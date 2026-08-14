@@ -19,27 +19,36 @@ async def cargar_entrega(picking_ids: list[int], user: dict = Depends(get_curren
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-@router.get("/diag/session-info")
-async def diag_session_info(user: dict = Depends(get_current_user)):
-    """Diagnostico: busca el nombre real de la BD en el HTML publico de login."""
+@router.get("/diag/probar-db")
+async def diag_probar_db(user: dict = Depends(get_current_user)):
+    """Prueba login contra Odoo con varios nombres de DB candidatos y reporta cual funciona."""
     url = os.getenv("ODOO_URL", "https://ecor-b2b-35977843.dev.odoo.com")
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        try:
-            r = await client.get(url + "/web/login")
-            texto = r.text
-            candidatos = set()
-            for pat in [
-                r'name=[\'"]db[\'"]\s+value=[\'"]([^\'"]+)[\'"]',
-                r'data-db=[\'"]([^\'"]+)[\'"]',
-                r'"db"\s*:\s*[\'"]([^\'"]+)[\'"]',
-            ]:
-                for m in re.finditer(pat, texto):
-                    candidatos.add(m.group(1))
-            return {
-                "status": r.status_code,
-                "candidatos_db": list(candidatos),
-                "largo_html": len(texto),
-                "primeros_3000": texto[:3000]
+    login = os.getenv("ODOO_LOGIN", "")
+    password = os.getenv("ODOO_API_KEY", "")
+
+    candidatos = [
+        "",
+        "ecor-b2b-35977843",
+        "ecor_b2b_35977843",
+        "p_ecor_b2b_35977843",
+        "35977843",
+    ]
+
+    resultados = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for db in candidatos:
+            payload = {
+                "jsonrpc": "2.0", "method": "call",
+                "params": {"service": "common", "method": "login", "args": [db, login, password]}
             }
-        except Exception as e:
-            return {"error": str(e)}
+            try:
+                r = await client.post(url + "/jsonrpc", json=payload)
+                data = r.json()
+                if "error" in data:
+                    msg = data["error"].get("data", {}).get("message", data["error"].get("message", ""))
+                    resultados.append({"db_probada": db or "(vacio)", "ok": False, "error": msg[:200]})
+                else:
+                    resultados.append({"db_probada": db or "(vacio)", "ok": True, "uid": data.get("result")})
+            except Exception as e:
+                resultados.append({"db_probada": db or "(vacio)", "ok": False, "error": str(e)})
+    return {"login_usado": login, "resultados": resultados}
