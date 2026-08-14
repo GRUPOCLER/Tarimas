@@ -73,6 +73,10 @@ class Tarima(Base):
     fecha_cierre   = Column(DateTime, nullable=True)
     comentario     = Column(Text)
     cerrado_por    = Column(String(50))
+    peso_palet_kg  = Column(Float, default=0)
+    largo_cm       = Column(Float, default=0)
+    ancho_cm       = Column(Float, default=0)
+    alto_cm        = Column(Float, default=0)
     # Relaciones
     entrega        = relationship("Entrega", back_populates="tarimas")
     productos      = relationship("Producto", back_populates="tarima")
@@ -104,3 +108,25 @@ class LogAcceso(Base):
     accion  = Column(String(50))
     detalle = Column(Text)
     exito   = Column(Boolean, default=True)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Migracion ligera: agregar columnas nuevas si no existen
+        await conn.execute(text(
+            "ALTER TABLE productos ADD COLUMN IF NOT EXISTS id_tarima VARCHAR(30)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS peso_palet_kg FLOAT DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS largo_cm FLOAT DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ancho_cm FLOAT DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS alto_cm FLOAT DEFAULT 0"
+        ))
+    yield
