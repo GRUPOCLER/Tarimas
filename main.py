@@ -2,15 +2,21 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from sqlalchemy import text
 
 load_dotenv()
 
 from database import engine, Base
 from routers import auth, entregas, catalogo, dashboard, setup, odoo
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migracion ligera: agregar columnas nuevas si no existen
+        await conn.execute(text(
+            "ALTER TABLE productos ADD COLUMN IF NOT EXISTS id_tarima VARCHAR(30)"
+        ))
     yield
 
 app = FastAPI(
@@ -32,7 +38,7 @@ app.include_router(entregas.router,  prefix="/api/entregas",  tags=["entregas"])
 app.include_router(catalogo.router,  prefix="/api/catalogo",  tags=["catalogo"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(setup.router,     prefix="/api/setup",     tags=["setup"])
-app.include_router(odoo.router, prefix="/api/odoo", tags=["odoo"])
+app.include_router(odoo.router,      prefix="/api/odoo",      tags=["odoo"])
 
 @app.get("/")
 def root():
