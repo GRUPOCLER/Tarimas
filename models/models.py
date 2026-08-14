@@ -73,7 +73,9 @@ class Tarima(Base):
     fecha_cierre   = Column(DateTime, nullable=True)
     comentario     = Column(Text)
     cerrado_por    = Column(String(50))
+    # Relaciones
     entrega        = relationship("Entrega", back_populates="tarimas")
+    productos      = relationship("Producto", back_populates="tarima")
 
 class CatalogoItem(Base):
     __tablename__ = "catalogo"
