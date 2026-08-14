@@ -6,8 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import engine, Base
-from routers import auth, entregas, catalogo, dashboard, setup
-
+from routers import auth, entregas, catalogo, dashboard, setup, odoo
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
@@ -33,6 +32,7 @@ app.include_router(entregas.router,  prefix="/api/entregas",  tags=["entregas"])
 app.include_router(catalogo.router,  prefix="/api/catalogo",  tags=["catalogo"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(setup.router,     prefix="/api/setup",     tags=["setup"])
+app.include_router(odoo.router, prefix="/api/odoo", tags=["odoo"])
 
 @app.get("/")
 def root():
