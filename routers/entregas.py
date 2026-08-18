@@ -4,10 +4,10 @@ from sqlalchemy import select, func
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import io, re
+import io, re, time
 
 from database import get_db
-from models.models import Entrega, Producto, Tarima, SistemaEnum, EstatusEntrega
+from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega
 from services.auth import verificar_token
 
 router = APIRouter()
@@ -62,6 +62,16 @@ class EntregaIn(BaseModel):
     fuente:         Optional[str] = "manual"
     productos:      List[ProductoIn]
 
+class CrearTarimaIn(BaseModel):
+    peso_palet_kg: Optional[float] = 0
+
+class AsignacionIn(BaseModel):
+    id_producto: str
+    cantidad:    int
+
+class AsignarLoteIn(BaseModel):
+    asignaciones: List[AsignacionIn]
+
 class CerrarTarimaIn(BaseModel):
     categoria: Optional[str] = ""
     notas:     Optional[str] = ""
@@ -69,17 +79,13 @@ class CerrarTarimaIn(BaseModel):
     ancho_cm:  Optional[float] = 0
     alto_cm:   Optional[float] = 0
 
-class CrearTarimaIn(BaseModel):
-    id_productos:  List[str] = []   # productos a incluir de una vez (opcional)
-    peso_palet_kg: Optional[float] = 0
-
-class AsignarTarimaIn(BaseModel):
-    id_tarima: Optional[str] = None  # None = quitar de la tarima (vuelve a suelto)
-
 class DimensionesIn(BaseModel):
     largo_cm: float = 0
     ancho_cm: float = 0
     alto_cm:  float = 0
+
+class ExtensionIn(BaseModel):
+    cantidad: int
 
 # ── HELPERS ───────────────────────────────────────────────────
 def _gen_id_entrega(sistema: str) -> str:
@@ -91,6 +97,9 @@ def _gen_id_prod(id_entrega: str, idx: int) -> str:
 
 def _gen_id_tarima(id_entrega: str, idx: int) -> str:
     return f"{id_entrega}-T{idx:03d}"
+
+def _gen_id_detalle(id_tarima: str) -> str:
+    return f"{id_tarima}-D{int(time.time()*1000) % 1000000}"
 
 def _numero_tarima(id_tarima: str) -> int:
     m = re.search(r"-T(\d+)$", id_tarima)
@@ -123,11 +132,22 @@ async def detalle_entrega(
     entrega = result.scalar_one_or_none()
     if not entrega:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
-    prods = await db.execute(select(Producto).where(Producto.id_entrega == id_entrega))
-    tarimas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
+
+    prods_r  = await db.execute(select(Producto).where(Producto.id_entrega == id_entrega))
+    productos = list(prods_r.scalars())
+
+    tarimas_r = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
+    tarimas = list(tarimas_r.scalars())
+
+    detalles_r = await db.execute(
+        select(DetalleTarima).where(DetalleTarima.id_tarima.in_([t.id_tarima for t in tarimas]))
+        if tarimas else select(DetalleTarima).where(False)
+    )
+    detalles = list(detalles_r.scalars())
+
     data = _serializar_entrega(entrega)
-    data["productos"] = [_ser_prod(p) for p in prods.scalars()]
-    data["tarimas"]   = [_ser_tarima(t) for t in tarimas.scalars()]
+    data["productos"] = [_ser_prod(p) for p in productos]
+    data["tarimas"] = [_ser_tarima(t, [d for d in detalles if d.id_tarima == t.id_tarima]) for t in tarimas]
     return data
 
 # ── CREAR ENTREGA ─────────────────────────────────────────────
@@ -154,14 +174,17 @@ async def crear_entrega(
     )
     db.add(entrega)
     for i, p in enumerate(body.productos, 1):
+        cant = p.cantidad_total
         db.add(Producto(
-            id_producto    = _gen_id_prod(id_e, i),
-            id_entrega     = id_e,
-            clave          = p.clave.strip().upper(),
-            descripcion    = p.descripcion,
-            cantidad_total = p.cantidad_total,
-            unidad         = p.unidad,
-            es_extension   = p.es_extension
+            id_producto        = _gen_id_prod(id_e, i),
+            id_entrega         = id_e,
+            clave              = p.clave.strip().upper(),
+            descripcion        = p.descripcion,
+            cantidad_total     = cant,
+            cantidad_asignada  = 0,
+            cantidad_pendiente = cant,
+            unidad             = p.unidad,
+            es_extension       = p.es_extension
         ))
     await db.commit()
     return {"ok": True, "id_entrega": id_e, "total": len(body.productos)}
@@ -205,7 +228,38 @@ def _extraer_texto_pdf(contenido: bytes) -> str:
             texto += (page.extract_text() or "") + "\n"
     return texto
 
-# ── CREAR TARIMA (agrupar productos) ──────────────────────────
+# ── EXTENSION DE SKU (empaque fisico separado) ────────────────
+@router.post("/{id_entrega}/productos/{id_producto}/extension")
+async def agregar_extension(
+    id_entrega:  str,
+    id_producto: str,
+    body:        ExtensionIn,
+    db:          AsyncSession = Depends(get_db),
+    user:        dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Producto).where(Producto.id_producto == id_producto, Producto.id_entrega == id_entrega))
+    original = result.scalar_one_or_none()
+    if not original:
+        raise HTTPException(status_code=404, detail="Producto original no encontrado")
+    cant = body.cantidad or 1
+
+    existentes = await db.execute(
+        select(func.count(Producto.id_producto)).where(Producto.id_producto.like(f"{id_producto}-EXT%"))
+    )
+    num_ext = (existentes.scalar() or 0) + 1
+    id_ext  = f"{id_producto}-EXT{num_ext}"
+
+    db.add(Producto(
+        id_producto=id_ext, id_entrega=id_entrega,
+        clave=f"{original.clave} (EXT{num_ext})",
+        descripcion=f"{original.descripcion} - Extension/empaque adicional",
+        cantidad_total=cant, cantidad_asignada=0, cantidad_pendiente=cant,
+        unidad=original.unidad
+    ))
+    await db.commit()
+    return {"ok": True, "id_producto": id_ext, "clave": f"{original.clave} (EXT{num_ext})"}
+
+# ── CREAR TARIMA (vacia) ───────────────────────────────────────
 @router.post("/{id_entrega}/tarimas")
 async def crear_tarima(
     id_entrega: str,
@@ -214,52 +268,86 @@ async def crear_tarima(
     user:       dict = Depends(get_current_user)
 ):
     result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
-    entrega = result.scalar_one_or_none()
-    if not entrega:
+    if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
 
     conteo = await db.execute(select(func.count(Tarima.id_tarima)).where(Tarima.id_entrega == id_entrega))
     idx = (conteo.scalar() or 0) + 1
     id_t = _gen_id_tarima(id_entrega, idx)
 
-    tarima = Tarima(
-        id_tarima=id_t, id_entrega=id_entrega, estatus="abierta",
-        peso_palet_kg=body.peso_palet_kg or 0
-    )
-    db.add(tarima)
-
-    if body.id_productos:
-        prods = await db.execute(
-            select(Producto).where(Producto.id_producto.in_(body.id_productos), Producto.id_entrega == id_entrega)
-        )
-        for p in prods.scalars():
-            p.id_tarima = id_t
-
+    db.add(Tarima(id_tarima=id_t, id_entrega=id_entrega, estatus="abierta", peso_palet_kg=body.peso_palet_kg or 0))
     await db.commit()
     return {"ok": True, "id_tarima": id_t, "numero_tarima": idx}
 
-# ── ASIGNAR / QUITAR PRODUCTO DE UNA TARIMA ───────────────────
-@router.patch("/{id_entrega}/productos/{id_producto}/tarima")
-async def asignar_tarima(
-    id_entrega:  str,
-    id_producto: str,
-    body:        AsignarTarimaIn,
-    db:          AsyncSession = Depends(get_db),
-    user:        dict = Depends(get_current_user)
+# ── ASIGNAR CANTIDADES DE PRODUCTOS A UNA TARIMA ──────────────
+@router.post("/{id_entrega}/tarimas/{id_tarima}/asignar")
+async def asignar_productos(
+    id_entrega: str,
+    id_tarima:  str,
+    body:       AsignarLoteIn,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
 ):
-    result = await db.execute(
-        select(Producto).where(Producto.id_producto == id_producto, Producto.id_entrega == id_entrega)
-    )
-    prod = result.scalar_one_or_none()
-    if not prod:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    t = await db.execute(select(Tarima).where(Tarima.id_tarima == id_tarima, Tarima.id_entrega == id_entrega))
+    tarima = t.scalar_one_or_none()
+    if not tarima:
+        raise HTTPException(status_code=404, detail="Tarima no encontrada")
+    if tarima.estatus == "cerrada":
+        raise HTTPException(status_code=400, detail="La tarima esta cerrada")
 
-    if body.id_tarima:
-        t = await db.execute(select(Tarima).where(Tarima.id_tarima == body.id_tarima, Tarima.id_entrega == id_entrega))
-        if not t.scalar_one_or_none():
-            raise HTTPException(status_code=404, detail="Tarima no encontrada")
+    errores = []
+    asignados = 0
+    for asig in body.asignaciones:
+        if asig.cantidad <= 0:
+            continue
+        pr = await db.execute(select(Producto).where(Producto.id_producto == asig.id_producto, Producto.id_entrega == id_entrega))
+        prod = pr.scalar_one_or_none()
+        if not prod:
+            errores.append(f"Producto no encontrado: {asig.id_producto}")
+            continue
+        if asig.cantidad > prod.cantidad_pendiente:
+            errores.append(f"[{prod.clave}]: solicitado {asig.cantidad}, disponible {prod.cantidad_pendiente}")
+            continue
 
-    prod.id_tarima = body.id_tarima
+        db.add(DetalleTarima(
+            id_detalle=_gen_id_detalle(id_tarima), id_tarima=id_tarima, id_producto=prod.id_producto,
+            clave=prod.clave, descripcion=prod.descripcion, cantidad_asignada=asig.cantidad, unidad=prod.unidad
+        ))
+        prod.cantidad_asignada  += asig.cantidad
+        prod.cantidad_pendiente -= asig.cantidad
+        asignados += 1
+
+    if errores and asignados == 0:
+        raise HTTPException(status_code=400, detail="; ".join(errores))
+
+    await db.commit()
+    return {"ok": True, "asignados": asignados, "advertencias": errores or None}
+
+# ── QUITAR UNA ASIGNACION (devuelve stock al pendiente) ───────
+@router.delete("/{id_entrega}/detalle/{id_detalle}")
+async def quitar_detalle(
+    id_entrega: str,
+    id_detalle: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    d = await db.execute(select(DetalleTarima).where(DetalleTarima.id_detalle == id_detalle))
+    det = d.scalar_one_or_none()
+    if not det:
+        raise HTTPException(status_code=404, detail="Registro no encontrado")
+
+    t = await db.execute(select(Tarima).where(Tarima.id_tarima == det.id_tarima))
+    tarima = t.scalar_one_or_none()
+    if tarima and tarima.estatus == "cerrada":
+        raise HTTPException(status_code=400, detail="No se puede modificar una tarima cerrada")
+
+    pr = await db.execute(select(Producto).where(Producto.id_producto == det.id_producto))
+    prod = pr.scalar_one_or_none()
+    if prod:
+        prod.cantidad_asignada  = max(0, prod.cantidad_asignada - det.cantidad_asignada)
+        prod.cantidad_pendiente = prod.cantidad_pendiente + det.cantidad_asignada
+
+    await db.delete(det)
     await db.commit()
     return {"ok": True}
 
@@ -282,7 +370,7 @@ async def actualizar_dimensiones(
     await db.commit()
     return {"ok": True}
 
-# ── ELIMINAR TARIMA (los productos vuelven a sueltos) ─────────
+# ── ELIMINAR TARIMA (devuelve todas sus cantidades) ────────────
 @router.delete("/{id_entrega}/tarimas/{id_tarima}")
 async def eliminar_tarima(
     id_entrega: str,
@@ -295,9 +383,13 @@ async def eliminar_tarima(
     if not tarima:
         raise HTTPException(status_code=404, detail="Tarima no encontrada")
 
-    prods = await db.execute(select(Producto).where(Producto.id_tarima == id_tarima))
-    for p in prods.scalars():
-        p.id_tarima = None
+    detalles = await db.execute(select(DetalleTarima).where(DetalleTarima.id_tarima == id_tarima))
+    for det in detalles.scalars():
+        pr = await db.execute(select(Producto).where(Producto.id_producto == det.id_producto))
+        prod = pr.scalar_one_or_none()
+        if prod:
+            prod.cantidad_asignada  = max(0, prod.cantidad_asignada - det.cantidad_asignada)
+            prod.cantidad_pendiente = prod.cantidad_pendiente + det.cantidad_asignada
 
     await db.delete(tarima)
     await db.commit()
@@ -324,15 +416,21 @@ async def etiqueta_tarima(
     todas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
     total_tarimas = len(todas.scalars().all())
 
-    prods = await db.execute(select(Producto).where(Producto.id_tarima == id_tarima))
-    productos = [_ser_prod(p) for p in prods.scalars()]
+    detalles_r = await db.execute(select(DetalleTarima).where(DetalleTarima.id_tarima == id_tarima))
+    productos = [{
+        "id_producto":    d.id_producto,
+        "clave":          d.clave,
+        "descripcion":    d.descripcion,
+        "cantidad_total": d.cantidad_asignada,
+        "unidad":         d.unidad,
+    } for d in detalles_r.scalars()]
 
     folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_tarima).upper())
     numero_tarima = _numero_tarima(id_tarima)
     barcode_entrega = folio_limpio
     barcode_tarima  = f"{folio_limpio}-T{numero_tarima}"
 
-    peso_palet  = tarima.peso_palet_kg or 0
+    peso_palet   = tarima.peso_palet_kg or 0
     total_piezas = sum(p["cantidad_total"] for p in productos)
 
     return {
@@ -352,7 +450,6 @@ async def etiqueta_tarima(
         "productos":       productos,
         "total_piezas":    total_piezas,
         "peso_palet_kg":   peso_palet,
-        # peso_neto se calculara cuando se sincronice el catalogo HMCK; por ahora 0
         "peso_neto_kg":    0,
         "peso_bruto_kg":   peso_palet,
         "largo_cm":        tarima.largo_cm or 0,
@@ -364,7 +461,7 @@ async def etiqueta_tarima(
         "barcode_tarima_url":  _barcode_url(barcode_tarima),
     }
 
-# ── TODAS LAS ETIQUETAS DE UNA ENTREGA (imprimir juntas) ──────
+# ── TODAS LAS ETIQUETAS DE UNA ENTREGA ─────────────────────────
 @router.get("/{id_entrega}/etiquetas")
 async def todas_etiquetas(
     id_entrega: str,
@@ -393,8 +490,8 @@ async def cerrar_tarima(
     tarima = result.scalar_one_or_none()
     if not tarima:
         raise HTTPException(status_code=404, detail="Tarima no encontrada")
-    tarima.estatus     = "cerrada"
-    tarima.fecha_cierre= datetime.utcnow()
+    tarima.estatus      = "cerrada"
+    tarima.fecha_cierre = datetime.utcnow()
     if body.categoria:
         tarima.comentario = body.categoria + (f" — {body.notas}" if body.notas else "")
     if body.largo_cm: tarima.largo_cm = body.largo_cm
@@ -455,17 +552,29 @@ def _serializar_entrega(e: Entrega) -> dict:
 
 def _ser_prod(p: Producto) -> dict:
     return {
-        "id_producto":    p.id_producto,
-        "id_entrega":     p.id_entrega,
-        "id_tarima":      p.id_tarima,
-        "clave":          p.clave,
-        "descripcion":    p.descripcion,
-        "cantidad_total": p.cantidad_total,
-        "unidad":         p.unidad,
-        "es_extension":   p.es_extension,
+        "id_producto":        p.id_producto,
+        "id_entrega":         p.id_entrega,
+        "clave":              p.clave,
+        "descripcion":        p.descripcion,
+        "cantidad_total":     p.cantidad_total,
+        "cantidad_asignada":  p.cantidad_asignada or 0,
+        "cantidad_pendiente": p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total,
+        "unidad":             p.unidad,
+        "es_extension":       p.es_extension,
     }
 
-def _ser_tarima(t: Tarima) -> dict:
+def _ser_detalle(d: DetalleTarima) -> dict:
+    return {
+        "id_detalle":        d.id_detalle,
+        "id_tarima":         d.id_tarima,
+        "id_producto":       d.id_producto,
+        "clave":             d.clave,
+        "descripcion":       d.descripcion,
+        "cantidad_asignada": d.cantidad_asignada,
+        "unidad":            d.unidad,
+    }
+
+def _ser_tarima(t: Tarima, detalles: list = None) -> dict:
     return {
         "id_tarima":      t.id_tarima,
         "id_entrega":     t.id_entrega,
@@ -479,4 +588,5 @@ def _ser_tarima(t: Tarima) -> dict:
         "largo_cm":       t.largo_cm or 0,
         "ancho_cm":       t.ancho_cm or 0,
         "alto_cm":        t.alto_cm or 0,
+        "productos":      [_ser_detalle(d) for d in (detalles or [])],
     }
