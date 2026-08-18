@@ -37,7 +37,7 @@ class Entrega(Base):
     __tablename__ = "entregas"
     id_entrega     = Column(String(20), primary_key=True)
     num_entrega    = Column(String(60), index=True)
-    sistema        = Column(String(10), nullable=False)   # TAR | CS | MIX
+    sistema        = Column(String(20), nullable=False)   # TAR | CS | MIX
     nombre_cliente = Column(String(200))
     rfc_cliente    = Column(String(20))
     direccion      = Column(Text)
