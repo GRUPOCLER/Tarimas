@@ -139,11 +139,13 @@ async def detalle_entrega(
     tarimas_r = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
     tarimas = list(tarimas_r.scalars())
 
-    detalles_r = await db.execute(
-        select(DetalleTarima).where(DetalleTarima.id_tarima.in_([t.id_tarima for t in tarimas]))
-        if tarimas else select(DetalleTarima).where(False)
-    )
-    detalles = list(detalles_r.scalars())
+    if tarimas:
+        detalles_r = await db.execute(
+            select(DetalleTarima).where(DetalleTarima.id_tarima.in_([t.id_tarima for t in tarimas]))
+        )
+        detalles = list(detalles_r.scalars())
+    else:
+        detalles = []
 
     data = _serializar_entrega(entrega)
     data["productos"] = [_ser_prod(p) for p in productos]
