@@ -50,7 +50,7 @@ class Entrega(Base):
     productos      = relationship("Producto", back_populates="entrega", cascade="all,delete")
     tarimas        = relationship("Tarima",   back_populates="entrega", cascade="all,delete")
 
-cclass Producto(Base):
+class Producto(Base):
     __tablename__ = "productos"
     id_producto    = Column(String(30), primary_key=True)
     id_entrega     = Column(String(20), ForeignKey("entregas.id_entrega"), nullable=False)
