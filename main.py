@@ -43,7 +43,10 @@ async def lifespan(app: FastAPI):
     # independientes para que un fallo no aborte la migracion principal
     for stmt in [
         "ALTER TABLE entregas ALTER COLUMN sistema DROP DEFAULT",
-        "ALTER TABLE entregas ALTER COLUMN sistema TYPE VARCHAR(10) USING sistema::text",
+        "ALTER TABLE entregas ALTER COLUMN sistema TYPE VARCHAR(20) USING sistema::text",
+        "UPDATE entregas SET sistema = 'TAR' WHERE sistema = 'tarimas'",
+        "UPDATE entregas SET sistema = 'CS'  WHERE sistema = 'carga_suelta'",
+        "UPDATE entregas SET sistema = 'MIX' WHERE sistema = 'mixta'",
         "ALTER TABLE entregas ALTER COLUMN estatus DROP DEFAULT",
         "ALTER TABLE entregas ALTER COLUMN estatus TYPE VARCHAR(20) USING estatus::text",
         "ALTER TABLE entregas ALTER COLUMN estatus SET DEFAULT 'pendiente'",
