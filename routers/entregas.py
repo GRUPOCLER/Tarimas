@@ -476,27 +476,30 @@ async def etiquetas_sueltas(
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
 
     prods_r = await db.execute(select(Producto).where(Producto.id_entrega == id_entrega))
-    productos = list(prods_r.scalars())
+    todos = list(prods_r.scalars())
+    # Solo lo que sigue pendiente (no asignado a ninguna tarima) se imprime como suelto
+    productos = [p for p in todos if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
     if not productos:
-        raise HTTPException(status_code=404, detail="Esta entrega no tiene productos")
+        raise HTTPException(status_code=404, detail="No hay productos pendientes de asignar (todo esta en tarimas)")
 
     folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_entrega).upper())
     barcode_entrega = folio_limpio
     barcode_url = _barcode_url(barcode_entrega)
 
     total_skus = len(productos)
-    total_piezas = sum(p.cantidad_total for p in productos)
+    total_piezas = sum(p.cantidad_pendiente for p in productos)
 
     resultado = []
     acumulado = 0
     for i, p in enumerate(productos, 1):
+        cant = p.cantidad_pendiente
         pieza_inicio = acumulado + 1
-        acumulado += p.cantidad_total
+        acumulado += cant
         resultado.append({
             "id_producto":         p.id_producto,
             "clave":               p.clave,
             "descripcion":         p.descripcion,
-            "cantidad":            p.cantidad_total,
+            "cantidad":            cant,
             "unidad":              p.unidad,
             "num_sku":             i,
             "total_skus_entrega":  total_skus,
