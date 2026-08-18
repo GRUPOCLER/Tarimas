@@ -12,14 +12,15 @@ class RolEnum(str, enum.Enum):
     editor = "editor"
 
 class SistemaEnum(str, enum.Enum):
-    tarimas      = "TAR"
-    carga_suelta = "CS"
-    mixta        = "MIX"
+    tarimas     = "TAR"
+    carga_suelta= "CS"
+    mixta       = "MIX"
 
 class EstatusEntrega(str, enum.Enum):
     pendiente  = "pendiente"
     completada = "completada"
 
+# ── USUARIOS ─────────────────────────────────────────────────
 class Usuario(Base):
     __tablename__ = "usuarios"
     id             = Column(String, primary_key=True, default=gen_id)
@@ -31,6 +32,7 @@ class Usuario(Base):
     ultimo_acceso  = Column(DateTime)
     creado_en      = Column(DateTime, server_default=func.now())
 
+# ── ENTREGAS ──────────────────────────────────────────────────
 class Entrega(Base):
     __tablename__ = "entregas"
     id_entrega     = Column(String(20), primary_key=True)
@@ -39,31 +41,34 @@ class Entrega(Base):
     nombre_cliente = Column(String(200))
     rfc_cliente    = Column(String(20))
     direccion      = Column(Text)
-    orden          = Column(String(40), index=True)
+    orden          = Column(String(40), index=True)   # OV Odoo
     fecha_entrega  = Column(String(20))
     fecha_creacion = Column(DateTime, server_default=func.now())
     estatus        = Column(Enum(EstatusEntrega), default=EstatusEntrega.pendiente)
     comercializador= Column(String(40))
     sucursal       = Column(String(60))
-    fuente         = Column(String(20), default="pdf")
+    fuente         = Column(String(20), default="pdf") # pdf | odoo | manual
     creado_por     = Column(String(50))
+    # Relaciones
     productos      = relationship("Producto", back_populates="entrega", cascade="all,delete")
     tarimas        = relationship("Tarima",   back_populates="entrega", cascade="all,delete")
 
+# ── PRODUCTOS ─────────────────────────────────────────────────
 class Producto(Base):
     __tablename__ = "productos"
-    id_producto    = Column(String(30), primary_key=True)
-    id_entrega     = Column(String(20), ForeignKey("entregas.id_entrega"), nullable=False)
-    id_tarima      = Column(String(30), ForeignKey("tarimas.id_tarima"), nullable=True, index=True)
-    clave          = Column(String(40), index=True)
-    descripcion    = Column(Text)
-    cantidad_total = Column(Integer, default=0)
-    unidad         = Column(String(20), default="PZA")
-    es_extension   = Column(Boolean, default=False)
+    id_producto        = Column(String(30), primary_key=True)
+    id_entrega         = Column(String(20), ForeignKey("entregas.id_entrega"), nullable=False)
+    clave              = Column(String(40), index=True)
+    descripcion        = Column(Text)
+    cantidad_total     = Column(Integer, default=0)
+    cantidad_asignada  = Column(Integer, default=0)
+    cantidad_pendiente = Column(Integer, default=0)
+    unidad             = Column(String(20), default="PZA")
+    es_extension       = Column(Boolean, default=False)
     # Relaciones
-    entrega        = relationship("Entrega", back_populates="productos")
-    tarima         = relationship("Tarima", back_populates="productos")
+    entrega            = relationship("Entrega", back_populates="productos")
 
+# ── TARIMAS ───────────────────────────────────────────────────
 class Tarima(Base):
     __tablename__ = "tarimas"
     id_tarima      = Column(String(30), primary_key=True)
@@ -79,8 +84,23 @@ class Tarima(Base):
     alto_cm        = Column(Float, default=0)
     # Relaciones
     entrega        = relationship("Entrega", back_populates="tarimas")
-    productos      = relationship("Producto", back_populates="tarima")
+    detalles       = relationship("DetalleTarima", back_populates="tarima", cascade="all,delete")
 
+# ── DETALLE DE TARIMA — reparto de cantidades por SKU ──────────
+class DetalleTarima(Base):
+    __tablename__ = "detalle_tarimas"
+    id_detalle        = Column(String(35), primary_key=True)
+    id_tarima         = Column(String(30), ForeignKey("tarimas.id_tarima"), nullable=False, index=True)
+    id_producto        = Column(String(30), ForeignKey("productos.id_producto"), nullable=False, index=True)
+    clave              = Column(String(40))
+    descripcion        = Column(Text)
+    cantidad_asignada  = Column(Integer, default=0)
+    unidad             = Column(String(20), default="PZA")
+    fecha_asignacion   = Column(DateTime, server_default=func.now())
+    # Relaciones
+    tarima             = relationship("Tarima", back_populates="detalles")
+
+# ── CATÁLOGO HMCK (cache local) ───────────────────────────────
 class CatalogoItem(Base):
     __tablename__ = "catalogo"
     sku            = Column(String(40), primary_key=True)
@@ -100,6 +120,7 @@ class CatalogoItem(Base):
     sat_desc       = Column(Text)
     actualizado_en = Column(DateTime, server_default=func.now())
 
+# ── LOG DE ACCESOS ────────────────────────────────────────────
 class LogAcceso(Base):
     __tablename__ = "log_accesos"
     id      = Column(Integer, primary_key=True, autoincrement=True)
@@ -108,25 +129,3 @@ class LogAcceso(Base):
     accion  = Column(String(50))
     detalle = Column(Text)
     exito   = Column(Boolean, default=True)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Migracion ligera: agregar columnas nuevas si no existen
-        await conn.execute(text(
-            "ALTER TABLE productos ADD COLUMN IF NOT EXISTS id_tarima VARCHAR(30)"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS peso_palet_kg FLOAT DEFAULT 0"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS largo_cm FLOAT DEFAULT 0"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ancho_cm FLOAT DEFAULT 0"
-        ))
-        await conn.execute(text(
-            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS alto_cm FLOAT DEFAULT 0"
-        ))
-    yield
