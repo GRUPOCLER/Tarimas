@@ -82,6 +82,7 @@ class Tarima(Base):
     largo_cm       = Column(Float, default=0)
     ancho_cm       = Column(Float, default=0)
     alto_cm        = Column(Float, default=0)
+    ids_entregas_fusionadas = Column(Text, nullable=True)  # "ID1,ID2,ID3" — mismo cliente
     # Relaciones
     entrega        = relationship("Entrega", back_populates="tarimas")
     detalles       = relationship("DetalleTarima", back_populates="tarima", cascade="all,delete")
