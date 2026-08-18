@@ -64,6 +64,10 @@ class EntregaIn(BaseModel):
 
 class CrearTarimaIn(BaseModel):
     peso_palet_kg: Optional[float] = 0
+    ids_entregas_fusionadas: Optional[List[str]] = None  # 2+ ids del mismo cliente
+
+class FusionDetalleIn(BaseModel):
+    ids_entregas: List[str]
 
 class AsignacionIn(BaseModel):
     id_producto: str
@@ -128,6 +132,69 @@ async def listar_entregas(
     return [_serializar_entrega(e) for e in entregas]
 
 # ── DETALLE DE ENTREGA ────────────────────────────────────────
+@router.get("/candidatas-fusion")
+async def candidatas_fusion(
+    db:   AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Entrega).where(Entrega.estatus == "pendiente"))
+    entregas = list(result.scalars())
+    por_cliente: dict = {}
+    for e in entregas:
+        cliente = (e.nombre_cliente or "Sin nombre").strip()
+        por_cliente.setdefault(cliente, []).append(_serializar_entrega(e))
+    return [{"cliente": c, "entregas": lista} for c, lista in por_cliente.items() if len(lista) >= 2]
+
+@router.post("/fusion/detalle")
+async def fusion_detalle(
+    body: FusionDetalleIn,
+    db:   AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    if len(body.ids_entregas) < 2:
+        raise HTTPException(status_code=400, detail="Selecciona al menos 2 entregas")
+
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega.in_(body.ids_entregas)))
+    entregas = list(result.scalars())
+    if len(entregas) != len(set(body.ids_entregas)):
+        raise HTTPException(status_code=404, detail="Alguna entrega no fue encontrada")
+    clientes = set((e.nombre_cliente or "").strip() for e in entregas)
+    if len(clientes) > 1:
+        raise HTTPException(status_code=400, detail="Solo puedes fusionar entregas del mismo cliente")
+
+    prods_r = await db.execute(select(Producto).where(Producto.id_entrega.in_(body.ids_entregas)))
+    productos = list(prods_r.scalars())
+
+    tarimas_ids = set()
+    tarimas_todas = []
+    for id_e in body.ids_entregas:
+        for t in await _tarimas_relacionadas(db, id_e):
+            if t.id_tarima not in tarimas_ids:
+                tarimas_ids.add(t.id_tarima)
+                tarimas_todas.append(t)
+
+    detalles_r = await db.execute(
+        select(DetalleTarima).where(DetalleTarima.id_tarima.in_(list(tarimas_ids)))
+    ) if tarimas_ids else None
+    detalles = list(detalles_r.scalars()) if detalles_r else []
+
+    total_unidades  = sum(p.cantidad_total for p in productos)
+    total_asignado  = sum(p.cantidad_asignada or 0 for p in productos)
+    total_pendiente = sum(p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total for p in productos)
+
+    return {
+        "es_fusion":       True,
+        "ids_entregas":    body.ids_entregas,
+        "entregas":        [_serializar_entrega(e) for e in entregas],
+        "cliente":         entregas[0].nombre_cliente,
+        "productos":       [_ser_prod(p) for p in productos],
+        "tarimas":         [_ser_tarima(t, [d for d in detalles if d.id_tarima == t.id_tarima]) for t in tarimas_todas],
+        "total_unidades":  total_unidades,
+        "total_asignado":  total_asignado,
+        "total_pendiente": total_pendiente,
+    }
+
+
 @router.get("/{id_entrega}")
 async def detalle_entrega(
     id_entrega: str,
@@ -267,7 +334,7 @@ async def agregar_extension(
     await db.commit()
     return {"ok": True, "id_producto": id_ext, "clave": f"{original.clave} (EXT{num_ext})"}
 
-# ── CREAR TARIMA (vacia) ───────────────────────────────────────
+# ── CREAR TARIMA (vacia, opcionalmente fusionada) ───────────────
 @router.post("/{id_entrega}/tarimas")
 async def crear_tarima(
     id_entrega: str,
@@ -276,14 +343,29 @@ async def crear_tarima(
     user:       dict = Depends(get_current_user)
 ):
     result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
-    if not result.scalar_one_or_none():
+    entrega = result.scalar_one_or_none()
+    if not entrega:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
+
+    fusion_str = None
+    if body.ids_entregas_fusionadas and len(body.ids_entregas_fusionadas) >= 2:
+        otras = await db.execute(select(Entrega).where(Entrega.id_entrega.in_(body.ids_entregas_fusionadas)))
+        entregas_fusion = list(otras.scalars())
+        if len(entregas_fusion) != len(set(body.ids_entregas_fusionadas)):
+            raise HTTPException(status_code=404, detail="Alguna entrega de la fusion no existe")
+        clientes = set((e.nombre_cliente or "").strip() for e in entregas_fusion)
+        if len(clientes) > 1:
+            raise HTTPException(status_code=400, detail="Solo puedes fusionar entregas del mismo cliente")
+        fusion_str = ",".join(body.ids_entregas_fusionadas)
 
     conteo = await db.execute(select(func.count(Tarima.id_tarima)).where(Tarima.id_entrega == id_entrega))
     idx = (conteo.scalar() or 0) + 1
     id_t = _gen_id_tarima(id_entrega, idx)
 
-    db.add(Tarima(id_tarima=id_t, id_entrega=id_entrega, estatus="abierta", peso_palet_kg=body.peso_palet_kg or 0))
+    db.add(Tarima(
+        id_tarima=id_t, id_entrega=id_entrega, estatus="abierta",
+        peso_palet_kg=body.peso_palet_kg or 0, ids_entregas_fusionadas=fusion_str
+    ))
     await db.commit()
     return {"ok": True, "id_tarima": id_t, "numero_tarima": idx}
 
@@ -303,14 +385,18 @@ async def asignar_productos(
     if tarima.estatus == "cerrada":
         raise HTTPException(status_code=400, detail="La tarima esta cerrada")
 
+    ids_permitidos = {id_entrega}
+    if tarima.ids_entregas_fusionadas:
+        ids_permitidos |= set(tarima.ids_entregas_fusionadas.split(","))
+
     errores = []
     asignados = 0
     for asig in body.asignaciones:
         if asig.cantidad <= 0:
             continue
-        pr = await db.execute(select(Producto).where(Producto.id_producto == asig.id_producto, Producto.id_entrega == id_entrega))
+        pr = await db.execute(select(Producto).where(Producto.id_producto == asig.id_producto))
         prod = pr.scalar_one_or_none()
-        if not prod:
+        if not prod or prod.id_entrega not in ids_permitidos:
             errores.append(f"Producto no encontrado: {asig.id_producto}")
             continue
         if asig.cantidad > prod.cantidad_pendiente:
@@ -523,6 +609,78 @@ async def etiquetas_sueltas(
             "barcode_entrega_url": barcode_url,
         })
     return resultado
+
+# ── FUSION DE ENTREGAS (mismo cliente) ──────────────────────────
+async def _tarimas_relacionadas(db: AsyncSession, id_entrega: str):
+    """Tarimas propias de la entrega + tarimas fusionadas que la incluyen."""
+    propias = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
+    resultado = {t.id_tarima: t for t in propias.scalars()}
+    con_fusion = await db.execute(select(Tarima).where(Tarima.ids_entregas_fusionadas.is_not(None)))
+    for t in con_fusion.scalars():
+        if id_entrega in (t.ids_entregas_fusionadas or "").split(","):
+            resultado[t.id_tarima] = t
+    return list(resultado.values())
+
+# ── LISTA DE EMPAQUE (packing list) ─────────────────────────────
+@router.get("/{id_entrega}/packing")
+async def lista_empaque(
+    id_entrega: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+
+    tarimas = await _tarimas_relacionadas(db, id_entrega)
+    if not tarimas:
+        raise HTTPException(status_code=404, detail="Esta entrega no tiene tarimas. Crea y cierra tarimas primero.")
+
+    ids_involucrados = {id_entrega}
+    for t in tarimas:
+        ids_involucrados.add(t.id_entrega)
+        if t.ids_entregas_fusionadas:
+            ids_involucrados |= set(t.ids_entregas_fusionadas.split(","))
+
+    entregas_r = await db.execute(select(Entrega).where(Entrega.id_entrega.in_(list(ids_involucrados))))
+    entregas_involucradas = [_serializar_entrega(e) for e in entregas_r.scalars()]
+    es_fusion = len(entregas_involucradas) > 1
+
+    tarimas_ids = [t.id_tarima for t in tarimas]
+    detalles_r = await db.execute(select(DetalleTarima).where(DetalleTarima.id_tarima.in_(tarimas_ids)))
+    detalles = list(detalles_r.scalars())
+
+    tarimas_data = []
+    for t in sorted(tarimas, key=lambda x: _numero_tarima(x.id_tarima)):
+        det = [d for d in detalles if d.id_tarima == t.id_tarima]
+        piezas = sum(d.cantidad_asignada for d in det)
+        tarimas_data.append({
+            "id_tarima":     t.id_tarima,
+            "numero_tarima": _numero_tarima(t.id_tarima),
+            "estatus":       t.estatus,
+            "peso_palet_kg": t.peso_palet_kg or 0,
+            "largo_cm":      t.largo_cm or 0,
+            "ancho_cm":      t.ancho_cm or 0,
+            "alto_cm":       t.alto_cm or 0,
+            "total_piezas":  piezas,
+            "productos":     [_ser_detalle(d) for d in det],
+        })
+
+    folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_entrega).upper())
+
+    return {
+        "entrega":              _serializar_entrega(entrega),
+        "es_fusion":            es_fusion,
+        "entregas_involucradas":entregas_involucradas,
+        "remitente":            _remitente(entrega.comercializador),
+        "tarimas":              tarimas_data,
+        "total_bultos":         len(tarimas_data),
+        "total_piezas":         sum(t["total_piezas"] for t in tarimas_data),
+        "peso_palet_total_kg":  round(sum(t["peso_palet_kg"] for t in tarimas_data), 2),
+        "barcode_entrega":      folio_limpio,
+        "barcode_entrega_url":  _barcode_url(folio_limpio),
+    }
 
 # ── TODAS LAS ETIQUETAS DE UNA ENTREGA ─────────────────────────
 @router.get("/{id_entrega}/etiquetas")
