@@ -11,12 +11,46 @@ from routers import auth, entregas, catalogo, dashboard, setup, odoo
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Crear tablas al iniciar
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Migracion ligera: agregar columnas nuevas si no existen
         await conn.execute(text(
-            "ALTER TABLE productos ADD COLUMN IF NOT EXISTS id_tarima VARCHAR(30)"
+            "ALTER TABLE productos ADD COLUMN IF NOT EXISTS cantidad_asignada INTEGER DEFAULT 0"
         ))
+        await conn.execute(text(
+            "ALTER TABLE productos ADD COLUMN IF NOT EXISTS cantidad_pendiente INTEGER DEFAULT 0"
+        ))
+        # Backfill: productos sin asignaciones previas quedan con pendiente = total
+        await conn.execute(text(
+            "UPDATE productos SET cantidad_pendiente = cantidad_total "
+            "WHERE cantidad_asignada = 0 AND (cantidad_pendiente IS NULL OR cantidad_pendiente = 0)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS peso_palet_kg FLOAT DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS largo_cm FLOAT DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ancho_cm FLOAT DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS alto_cm FLOAT DEFAULT 0"
+        ))
+
+    # Convertir columnas enum de entregas a texto simple — en transacciones
+    # independientes para que un fallo no aborte la migracion principal
+    for stmt in [
+        "ALTER TABLE entregas ALTER COLUMN sistema TYPE VARCHAR(10) USING sistema::text",
+        "ALTER TABLE entregas ALTER COLUMN estatus TYPE VARCHAR(20) USING estatus::text",
+        "ALTER TABLE entregas ALTER COLUMN estatus SET DEFAULT 'pendiente'",
+    ]:
+        try:
+            async with engine.begin() as conn2:
+                await conn2.execute(text(stmt))
+        except Exception as e:
+            print(f"Migracion opcional omitida ({stmt[:50]}...): {e}")
     yield
 
 app = FastAPI(
@@ -27,7 +61,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # En produccion: URL del frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
