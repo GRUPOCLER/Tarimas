@@ -87,6 +87,12 @@ class DimensionesIn(BaseModel):
 class ExtensionIn(BaseModel):
     cantidad: int
 
+class ActualizarEntregaIn(BaseModel):
+    sucursal:        Optional[str] = None
+    comercializador: Optional[str] = None
+    direccion:       Optional[str] = None
+    nombre_cliente:  Optional[str] = None
+
 # ── HELPERS ───────────────────────────────────────────────────
 def _gen_id_entrega(sistema: str) -> str:
     ts = datetime.now().strftime("%y%m%d%H%M%S")
@@ -572,6 +578,29 @@ async def reabrir_tarima(
         raise HTTPException(status_code=404, detail="Tarima no encontrada")
     tarima.estatus      = "abierta"
     tarima.fecha_cierre = None
+    await db.commit()
+    return {"ok": True}
+
+# ── ACTUALIZAR SUCURSAL / COMERCIALIZADOR DE LA ENTREGA ───────
+@router.patch("/{id_entrega}")
+async def actualizar_entrega(
+    id_entrega: str,
+    body:       ActualizarEntregaIn,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+    if body.sucursal is not None:
+        entrega.sucursal = body.sucursal
+    if body.comercializador is not None:
+        entrega.comercializador = body.comercializador
+    if body.direccion is not None:
+        entrega.direccion = body.direccion
+    if body.nombre_cliente is not None:
+        entrega.nombre_cliente = body.nombre_cliente
     await db.commit()
     return {"ok": True}
 
