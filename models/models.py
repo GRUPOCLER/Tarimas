@@ -33,18 +33,19 @@ class Usuario(Base):
     creado_en      = Column(DateTime, server_default=func.now())
 
 # ── ENTREGAS ──────────────────────────────────────────────────
+
 class Entrega(Base):
     __tablename__ = "entregas"
     id_entrega     = Column(String(20), primary_key=True)
     num_entrega    = Column(String(60), index=True)
-    sistema        = Column(Enum(SistemaEnum), nullable=False)
+    sistema        = Column(String(10), nullable=False)   # TAR | CS | MIX
     nombre_cliente = Column(String(200))
     rfc_cliente    = Column(String(20))
     direccion      = Column(Text)
     orden          = Column(String(40), index=True)   # OV Odoo
     fecha_entrega  = Column(String(20))
     fecha_creacion = Column(DateTime, server_default=func.now())
-    estatus        = Column(Enum(EstatusEntrega), default=EstatusEntrega.pendiente)
+    estatus        = Column(String(20), default="pendiente")  # pendiente | completada
     comercializador= Column(String(40))
     sucursal       = Column(String(60))
     fuente         = Column(String(20), default="pdf") # pdf | odoo | manual
