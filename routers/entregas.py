@@ -463,6 +463,58 @@ async def etiqueta_tarima(
         "barcode_tarima_url":  _barcode_url(barcode_tarima),
     }
 
+# ── ETIQUETAS INDIVIDUALES POR SKU (carga suelta) ──────────────
+@router.get("/{id_entrega}/etiquetas-sueltas")
+async def etiquetas_sueltas(
+    id_entrega: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+
+    prods_r = await db.execute(select(Producto).where(Producto.id_entrega == id_entrega))
+    productos = list(prods_r.scalars())
+    if not productos:
+        raise HTTPException(status_code=404, detail="Esta entrega no tiene productos")
+
+    folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_entrega).upper())
+    barcode_entrega = folio_limpio
+    barcode_url = _barcode_url(barcode_entrega)
+
+    total_skus = len(productos)
+    total_piezas = sum(p.cantidad_total for p in productos)
+
+    resultado = []
+    acumulado = 0
+    for i, p in enumerate(productos, 1):
+        pieza_inicio = acumulado + 1
+        acumulado += p.cantidad_total
+        resultado.append({
+            "id_producto":         p.id_producto,
+            "clave":               p.clave,
+            "descripcion":         p.descripcion,
+            "cantidad":            p.cantidad_total,
+            "unidad":              p.unidad,
+            "num_sku":             i,
+            "total_skus_entrega":  total_skus,
+            "pieza_inicio":        pieza_inicio,
+            "total_piezas_entrega":total_piezas,
+            "num_entrega":         entrega.num_entrega,
+            "nombre_cliente":      entrega.nombre_cliente,
+            "direccion":           entrega.direccion,
+            "orden":               entrega.orden,
+            "comercializador":     entrega.comercializador,
+            "remitente":           _remitente(entrega.comercializador),
+            "sucursal":            entrega.sucursal,
+            "fecha_entrega":       entrega.fecha_entrega,
+            "barcode_entrega":     barcode_entrega,
+            "barcode_entrega_url": barcode_url,
+        })
+    return resultado
+
 # ── TODAS LAS ETIQUETAS DE UNA ENTREGA ─────────────────────────
 @router.get("/{id_entrega}/etiquetas")
 async def todas_etiquetas(
