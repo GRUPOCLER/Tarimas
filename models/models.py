@@ -33,7 +33,6 @@ class Usuario(Base):
     creado_en      = Column(DateTime, server_default=func.now())
 
 # ── ENTREGAS ──────────────────────────────────────────────────
-
 class Entrega(Base):
     __tablename__ = "entregas"
     id_entrega     = Column(String(20), primary_key=True)
