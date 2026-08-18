@@ -232,6 +232,24 @@ async def crear_entrega(
     db:   AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user)
 ):
+    # Evitar duplicados: misma OV/folio ya registrada en cualquier sistema
+    num_norm = (body.num_entrega or "").strip().upper()
+    orden_norm = (body.orden or "").strip().upper()
+    condiciones = [func.upper(Entrega.num_entrega) == num_norm] if num_norm else []
+    if orden_norm:
+        condiciones.append(func.upper(Entrega.orden) == orden_norm)
+    if condiciones:
+        from sqlalchemy import or_
+        dup = await db.execute(select(Entrega).where(or_(*condiciones)))
+        existente = dup.scalars().first()
+        if existente:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ya existe una entrega para '{body.num_entrega or body.orden}' "
+                       f"(folio {existente.id_entrega}, sistema {existente.sistema}). "
+                       f"No se puede registrar de nuevo en otro sistema."
+            )
+
     id_e = _gen_id_entrega(body.sistema)
     entrega = Entrega(
         id_entrega     = id_e,
@@ -634,8 +652,6 @@ async def lista_empaque(
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
 
     tarimas = await _tarimas_relacionadas(db, id_entrega)
-    if not tarimas:
-        raise HTTPException(status_code=404, detail="Esta entrega no tiene tarimas. Crea y cierra tarimas primero.")
 
     ids_involucrados = {id_entrega}
     for t in tarimas:
@@ -648,8 +664,10 @@ async def lista_empaque(
     es_fusion = len(entregas_involucradas) > 1
 
     tarimas_ids = [t.id_tarima for t in tarimas]
-    detalles_r = await db.execute(select(DetalleTarima).where(DetalleTarima.id_tarima.in_(tarimas_ids)))
-    detalles = list(detalles_r.scalars())
+    detalles_r = await db.execute(
+        select(DetalleTarima).where(DetalleTarima.id_tarima.in_(tarimas_ids))
+    ) if tarimas_ids else None
+    detalles = list(detalles_r.scalars()) if detalles_r else []
 
     tarimas_data = []
     for t in sorted(tarimas, key=lambda x: _numero_tarima(x.id_tarima)):
@@ -667,6 +685,22 @@ async def lista_empaque(
             "productos":     [_ser_detalle(d) for d in det],
         })
 
+    # Productos sueltos (sin tarima): en CS son todos; en MIX solo lo pendiente
+    prods_r = await db.execute(select(Producto).where(Producto.id_entrega.in_(list(ids_involucrados))))
+    todos_prods = list(prods_r.scalars())
+    if entrega.sistema == "CS":
+        sueltos_data = [_ser_prod(p) for p in todos_prods if p.cantidad_total > 0]
+    else:
+        sueltos_data = [_ser_prod(p) for p in todos_prods
+                         if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
+
+    if not tarimas_data and not sueltos_data:
+        raise HTTPException(status_code=404, detail="No hay productos ni tarimas para generar la lista de empaque")
+
+    total_piezas_sueltos = sum(
+        (p["cantidad_pendiente"] if entrega.sistema != "CS" else p["cantidad_total"]) for p in sueltos_data
+    )
+
     folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_entrega).upper())
 
     return {
@@ -675,8 +709,10 @@ async def lista_empaque(
         "entregas_involucradas":entregas_involucradas,
         "remitente":            _remitente(entrega.comercializador),
         "tarimas":              tarimas_data,
+        "sueltos":              sueltos_data,
         "total_bultos":         len(tarimas_data),
-        "total_piezas":         sum(t["total_piezas"] for t in tarimas_data),
+        "total_piezas":         sum(t["total_piezas"] for t in tarimas_data) + total_piezas_sueltos,
+        "total_piezas_sueltos": total_piezas_sueltos,
         "peso_palet_total_kg":  round(sum(t["peso_palet_kg"] for t in tarimas_data), 2),
         "barcode_entrega":      folio_limpio,
         "barcode_entrega_url":  _barcode_url(folio_limpio),
