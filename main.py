@@ -42,15 +42,20 @@ async def lifespan(app: FastAPI):
     # Convertir columnas enum de entregas a texto simple — en transacciones
     # independientes para que un fallo no aborte la migracion principal
     for stmt in [
+        "ALTER TABLE entregas ALTER COLUMN sistema DROP DEFAULT",
         "ALTER TABLE entregas ALTER COLUMN sistema TYPE VARCHAR(10) USING sistema::text",
+        "ALTER TABLE entregas ALTER COLUMN estatus DROP DEFAULT",
         "ALTER TABLE entregas ALTER COLUMN estatus TYPE VARCHAR(20) USING estatus::text",
         "ALTER TABLE entregas ALTER COLUMN estatus SET DEFAULT 'pendiente'",
+        "DROP TYPE IF EXISTS sistemaenum",
+        "DROP TYPE IF EXISTS estatusentrega",
     ]:
         try:
             async with engine.begin() as conn2:
                 await conn2.execute(text(stmt))
+            print(f"[migracion] OK: {stmt}")
         except Exception as e:
-            print(f"Migracion opcional omitida ({stmt[:50]}...): {e}")
+            print(f"[migracion] omitida ({stmt}): {type(e).__name__}: {e}")
     yield
 
 app = FastAPI(
