@@ -38,6 +38,9 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS alto_cm FLOAT DEFAULT 0"
         ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ids_entregas_fusionadas TEXT"
+        ))
 
     # Convertir columnas enum de entregas a texto simple — en transacciones
     # independientes para que un fallo no aborte la migracion principal
