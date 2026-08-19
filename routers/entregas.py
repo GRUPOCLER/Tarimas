@@ -41,6 +41,13 @@ async def get_current_user(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Token invalido")
     return payload
 
+def require_roles(*roles):
+    async def dep(user: dict = Depends(get_current_user)):
+        if user.get("rol") not in roles:
+            raise HTTPException(status_code=403, detail="No tienes permisos para esta accion. Se requiere autorizacion de un Gerente.")
+        return user
+    return dep
+
 # ── SCHEMAS ───────────────────────────────────────────────────
 class ProductoIn(BaseModel):
     clave:          str
@@ -793,13 +800,13 @@ async def cerrar_tarima(
     await db.commit()
     return {"ok": True}
 
-# ── REABRIR TARIMA ─────────────────────────────────────────────
+# ── REABRIR TARIMA (solo Gerente/Admin) ─────────────────────────
 @router.post("/{id_entrega}/tarimas/{id_tarima}/reabrir")
 async def reabrir_tarima(
     id_entrega: str,
     id_tarima:  str,
     db:         AsyncSession = Depends(get_db),
-    user:       dict = Depends(get_current_user)
+    user:       dict = Depends(require_roles("admin", "gerente"))
 ):
     result = await db.execute(select(Tarima).where(Tarima.id_tarima == id_tarima, Tarima.id_entrega == id_entrega))
     tarima = result.scalar_one_or_none()
@@ -847,6 +854,81 @@ async def completar_entrega(
     entrega.estatus = EstatusEntrega.completada
     await db.commit()
     return {"ok": True}
+
+# ── REABRIR ENTREGA (solo Gerente/Admin) ────────────────────────
+@router.post("/{id_entrega}/reabrir")
+async def reabrir_entrega(
+    id_entrega: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(require_roles("admin", "gerente"))
+):
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+    entrega.estatus = "pendiente"
+    await db.commit()
+    return {"ok": True}
+
+# ── MARCAR IMPRESION (bloquea reimpresion a Operador) ───────────
+async def _controlar_impresion(user: dict, veces_previas: int) -> bool:
+    """Retorna True si se permite imprimir. Si ya se imprimio antes,
+    solo Admin/Gerente pueden volver a hacerlo."""
+    if veces_previas > 0 and user.get("rol") not in ("admin", "gerente"):
+        raise HTTPException(
+            status_code=403,
+            detail="Este documento ya fue impreso. Se requiere autorizacion de un Gerente para reimprimir."
+        )
+    return True
+
+@router.post("/{id_entrega}/tarimas/{id_tarima}/marcar-impresa")
+async def marcar_impresa_tarima(
+    id_entrega: str,
+    id_tarima:  str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Tarima).where(Tarima.id_tarima == id_tarima, Tarima.id_entrega == id_entrega))
+    tarima = result.scalar_one_or_none()
+    if not tarima:
+        raise HTTPException(status_code=404, detail="Tarima no encontrada")
+    await _controlar_impresion(user, tarima.impresa_veces or 0)
+    if not tarima.impresa_veces:
+        tarima.primera_impresion_en  = datetime.utcnow()
+        tarima.primera_impresion_por = user["sub"]
+    tarima.impresa_veces = (tarima.impresa_veces or 0) + 1
+    await db.commit()
+    return {"ok": True, "veces": tarima.impresa_veces}
+
+@router.post("/{id_entrega}/etiquetas-sueltas/marcar-impresa")
+async def marcar_impresa_sueltas(
+    id_entrega: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+    await _controlar_impresion(user, entrega.etiquetas_sueltas_impresas_veces or 0)
+    entrega.etiquetas_sueltas_impresas_veces = (entrega.etiquetas_sueltas_impresas_veces or 0) + 1
+    await db.commit()
+    return {"ok": True, "veces": entrega.etiquetas_sueltas_impresas_veces}
+
+@router.post("/{id_entrega}/packing/marcar-impreso")
+async def marcar_impreso_packing(
+    id_entrega: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+    await _controlar_impresion(user, entrega.packing_impreso_veces or 0)
+    entrega.packing_impreso_veces = (entrega.packing_impreso_veces or 0) + 1
+    await db.commit()
+    return {"ok": True, "veces": entrega.packing_impreso_veces}
 
 # ── SERIALIZERS ───────────────────────────────────────────────
 def _serializar_entrega(e: Entrega) -> dict:
