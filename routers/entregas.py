@@ -132,11 +132,16 @@ async def listar_entregas(
 
     # Cruzar con tarimas fusionadas para marcar que entregas estan agrupadas
     tarimas_fus = await db.execute(select(Tarima).where(Tarima.ids_entregas_fusionadas.is_not(None)))
-    grupos: dict = {}  # id_entrega -> set(otros ids del mismo grupo)
+    grupos: dict = {}       # id_entrega -> set(otros ids del mismo grupo)
+    grupo_clave: dict = {}  # id_entrega -> clave de grupo compartida (para colorear igual en frontend)
     for t in tarimas_fus.scalars():
-        ids = set(x for x in t.ids_entregas_fusionadas.split(",") if x)
+        ids = sorted(set(x for x in t.ids_entregas_fusionadas.split(",") if x))
+        if not ids:
+            continue
+        clave = "|".join(ids)
         for id_e in ids:
-            grupos.setdefault(id_e, set()).update(ids - {id_e})
+            grupos.setdefault(id_e, set()).update(set(ids) - {id_e})
+            grupo_clave[id_e] = clave
 
     ids_para_nombres = set()
     for otros in grupos.values():
@@ -151,11 +156,13 @@ async def listar_entregas(
         data = _serializar_entrega(e)
         otros_ids = grupos.get(e.id_entrega)
         if otros_ids:
-            data["es_fusion"] = True
-            data["fusion_con"] = [nombres.get(i, i) for i in otros_ids]
+            data["es_fusion"]    = True
+            data["fusion_con"]   = [nombres.get(i, i) for i in otros_ids]
+            data["grupo_fusion"] = grupo_clave.get(e.id_entrega)
         else:
-            data["es_fusion"] = False
-            data["fusion_con"] = []
+            data["es_fusion"]    = False
+            data["fusion_con"]   = []
+            data["grupo_fusion"] = None
         resultado.append(data)
     return resultado
 
