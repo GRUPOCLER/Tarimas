@@ -26,7 +26,7 @@ class Usuario(Base):
     id             = Column(String, primary_key=True, default=gen_id)
     usuario        = Column(String(50), unique=True, nullable=False, index=True)
     password_hash  = Column(String(64), nullable=False)
-    rol            = Column(Enum(RolEnum), default=RolEnum.editor)
+    rol            = Column(String(20), default="operador")  # admin | gerente | operador
     activo         = Column(Boolean, default=True)
     nombre_display = Column(String(100))
     ultimo_acceso  = Column(DateTime)
@@ -49,6 +49,8 @@ class Entrega(Base):
     sucursal       = Column(String(60))
     fuente         = Column(String(20), default="pdf") # pdf | odoo | manual
     creado_por     = Column(String(50))
+    etiquetas_sueltas_impresas_veces = Column(Integer, default=0)
+    packing_impreso_veces            = Column(Integer, default=0)
     # Relaciones
     productos      = relationship("Producto", back_populates="entrega", cascade="all,delete")
     tarimas        = relationship("Tarima",   back_populates="entrega", cascade="all,delete")
@@ -83,6 +85,9 @@ class Tarima(Base):
     ancho_cm       = Column(Float, default=0)
     alto_cm        = Column(Float, default=0)
     ids_entregas_fusionadas = Column(Text, nullable=True)  # "ID1,ID2,ID3" — mismo cliente
+    impresa_veces        = Column(Integer, default=0)
+    primera_impresion_en = Column(DateTime, nullable=True)
+    primera_impresion_por= Column(String(50), nullable=True)
     # Relaciones
     entrega        = relationship("Entrega", back_populates="tarimas")
     detalles       = relationship("DetalleTarima", back_populates="tarima", cascade="all,delete")
