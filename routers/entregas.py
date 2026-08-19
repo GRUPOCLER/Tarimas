@@ -129,7 +129,35 @@ async def listar_entregas(
     if estatus: q = q.where(Entrega.estatus == estatus)
     result = await db.execute(q)
     entregas = result.scalars().all()
-    return [_serializar_entrega(e) for e in entregas]
+
+    # Cruzar con tarimas fusionadas para marcar que entregas estan agrupadas
+    tarimas_fus = await db.execute(select(Tarima).where(Tarima.ids_entregas_fusionadas.is_not(None)))
+    grupos: dict = {}  # id_entrega -> set(otros ids del mismo grupo)
+    for t in tarimas_fus.scalars():
+        ids = set(x for x in t.ids_entregas_fusionadas.split(",") if x)
+        for id_e in ids:
+            grupos.setdefault(id_e, set()).update(ids - {id_e})
+
+    ids_para_nombres = set()
+    for otros in grupos.values():
+        ids_para_nombres |= otros
+    nombres = {}
+    if ids_para_nombres:
+        nr = await db.execute(select(Entrega.id_entrega, Entrega.num_entrega).where(Entrega.id_entrega.in_(list(ids_para_nombres))))
+        nombres = {row[0]: row[1] for row in nr.all()}
+
+    resultado = []
+    for e in entregas:
+        data = _serializar_entrega(e)
+        otros_ids = grupos.get(e.id_entrega)
+        if otros_ids:
+            data["es_fusion"] = True
+            data["fusion_con"] = [nombres.get(i, i) for i in otros_ids]
+        else:
+            data["es_fusion"] = False
+            data["fusion_con"] = []
+        resultado.append(data)
+    return resultado
 
 # ── DETALLE DE ENTREGA ────────────────────────────────────────
 @router.get("/candidatas-fusion")
