@@ -7,7 +7,7 @@ from sqlalchemy import text
 load_dotenv()
 
 from database import engine, Base
-from routers import auth, entregas, catalogo, dashboard, setup, odoo
+from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,6 +41,21 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ids_entregas_fusionadas TEXT"
         ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS impresa_veces INTEGER DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS primera_impresion_en TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS primera_impresion_por VARCHAR(50)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS etiquetas_sueltas_impresas_veces INTEGER DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS packing_impreso_veces INTEGER DEFAULT 0"
+        ))
 
     # Convertir columnas enum de entregas a texto simple — en transacciones
     # independientes para que un fallo no aborte la migracion principal
@@ -55,6 +70,11 @@ async def lifespan(app: FastAPI):
         "ALTER TABLE entregas ALTER COLUMN estatus SET DEFAULT 'pendiente'",
         "DROP TYPE IF EXISTS sistemaenum",
         "DROP TYPE IF EXISTS estatusentrega",
+        "ALTER TABLE usuarios ALTER COLUMN rol DROP DEFAULT",
+        "ALTER TABLE usuarios ALTER COLUMN rol TYPE VARCHAR(20) USING rol::text",
+        "ALTER TABLE usuarios ALTER COLUMN rol SET DEFAULT 'operador'",
+        "UPDATE usuarios SET rol = 'operador' WHERE rol = 'editor'",
+        "DROP TYPE IF EXISTS rolenum",
     ]:
         try:
             async with engine.begin() as conn2:
@@ -84,6 +104,7 @@ app.include_router(catalogo.router,  prefix="/api/catalogo",  tags=["catalogo"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(setup.router,     prefix="/api/setup",     tags=["setup"])
 app.include_router(odoo.router,      prefix="/api/odoo",      tags=["odoo"])
+app.include_router(admin.router,     prefix="/api/admin",     tags=["admin"])
 
 @app.get("/")
 def root():
