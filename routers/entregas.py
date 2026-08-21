@@ -604,6 +604,7 @@ async def etiqueta_tarima(
         "sucursal":        entrega.sucursal,
         "fecha_entrega":   entrega.fecha_entrega,
         "estatus":         tarima.estatus,
+        "impresa_veces":   tarima.impresa_veces or 0,
         "productos":       productos,
         "total_piezas":    total_piezas,
         "peso_palet_kg":   peso_palet,
@@ -670,6 +671,7 @@ async def etiquetas_sueltas(
             "fecha_entrega":       entrega.fecha_entrega,
             "barcode_entrega":     barcode_entrega,
             "barcode_entrega_url": barcode_url,
+            "impresa_veces":       entrega.etiquetas_sueltas_impresas_veces or 0,
         })
     return resultado
 
