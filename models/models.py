@@ -136,3 +136,19 @@ class LogAcceso(Base):
     accion  = Column(String(50))
     detalle = Column(Text)
     exito   = Column(Boolean, default=True)
+
+# ── SOLICITUDES DE REIMPRESION ──────────────────────────────────
+class SolicitudReimpresion(Base):
+    __tablename__ = "solicitudes_reimpresion"
+    id                     = Column(String(35), primary_key=True)
+    tipo                   = Column(String(20))   # TARIMA | SUELTAS | PACKING
+    id_entrega             = Column(String(20), index=True)
+    referencia             = Column(String(40))   # id_tarima o id_entrega, para mostrar
+    num_entrega            = Column(String(60))   # folio, para mostrar sin joins
+    motivo                 = Column(Text)
+    solicitado_por         = Column(String(50))
+    fecha_solicitud        = Column(DateTime, server_default=func.now())
+    estatus                = Column(String(20), default="pendiente")  # pendiente | aprobada | rechazada | usada
+    autorizado_por         = Column(String(50), nullable=True)
+    fecha_resolucion       = Column(DateTime, nullable=True)
+    comentario_resolucion  = Column(Text, nullable=True)
