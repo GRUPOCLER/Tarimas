@@ -2,6 +2,12 @@ import re
 
 def detectar_tipo(texto: str) -> str:
     muestra = texto[:800].upper()
+    # Traspasos Raiker (RetailOne) — chequeo en texto completo, layout desordenado
+    t_completo = texto.upper()
+    if 'RETAILONE' in t_completo.replace(' ', '') and \
+       ('SALIDA POR TRASPASO' in t_completo or 'ENTRADA POR TRASPASO' in t_completo):
+        return 'TRASPASO_RAIKER'
+    # ECOR siempre primero
     if re.search(r'[A-Z]{2,6}-[A-Z]{2,6}/OUT/\d+', muestra) or \
        'EQUIPOS COREANOS' in muestra or 'ECOR.MX' in muestra:
         return 'ECOR_ODOO'
