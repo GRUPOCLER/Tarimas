@@ -892,9 +892,15 @@ async def _controlar_impresion(db: AsyncSession, user: dict, veces_previas: int,
     if user.get("rol") in ("admin", "gerente"):
         if not (motivo or "").strip():
             raise HTTPException(status_code=400, detail="Debes indicar un motivo para justificar la reimpresion.")
+        ahora = datetime.utcnow()
         db.add(LogAcceso(
             usuario=user["sub"], accion=f"REIMPRESION_{tipo}",
             detalle=f"{referencia} — motivo: {motivo.strip()}", exito=True
+        ))
+        db.add(SolicitudReimpresion(
+            id=_gen_id_solicitud(), tipo=tipo, id_entrega=id_entrega, referencia=referencia,
+            num_entrega=num_entrega, motivo=motivo.strip(), solicitado_por=user["sub"],
+            estatus="aprobada", autorizado_por=user["sub"], fecha_resolucion=ahora
         ))
         return True
 
