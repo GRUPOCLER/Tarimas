@@ -953,6 +953,7 @@ async def _controlar_impresion(db: AsyncSession, user: dict, veces_previas: int,
         id=_gen_id_solicitud(), tipo=tipo, id_entrega=id_entrega, referencia=referencia,
         num_entrega=num_entrega, motivo=motivo.strip(), solicitado_por=user["sub"], estatus="pendiente"
     ))
+    await db.commit()
     raise HTTPException(status_code=403, detail="Solicitud enviada. Debe ser autorizada por un Gerente antes de imprimir.")
 
 def _gen_id_solicitud() -> str:
