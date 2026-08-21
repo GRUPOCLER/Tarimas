@@ -34,23 +34,26 @@ class UsuarioIn(BaseModel):
     usuario:        str
     password:       str
     nombre_display: str = ""
+    email:          Optional[str] = None
     rol:            str = "operador"
 
 class UsuarioEditIn(BaseModel):
     nombre_display: Optional[str] = None
+    email:          Optional[str] = None
     rol:            Optional[str] = None
     activo:         Optional[bool] = None
     password:       Optional[str] = None
 
-# ── LISTAR USUARIOS ────────────────────────────────────────────
+# ── LISTAR USUARIOS (solo Admin) ────────────────────────────────
 @router.get("/usuarios")
 async def listar_usuarios(
     db:   AsyncSession = Depends(get_db),
-    user: dict = Depends(require_roles("admin", "gerente"))
+    user: dict = Depends(require_roles("admin"))
 ):
     result = await db.execute(select(Usuario).order_by(Usuario.creado_en.desc()))
     return [{
         "usuario":        u.usuario,
+        "email":          u.email,
         "nombre_display": u.nombre_display,
         "rol":            u.rol,
         "activo":         u.activo,
@@ -58,17 +61,18 @@ async def listar_usuarios(
         "creado_en":      str(u.creado_en or ""),
     } for u in result.scalars()]
 
-# ── CREAR USUARIO ──────────────────────────────────────────────
+# ── CREAR USUARIO (Admin: cualquier rol / Gerente: solo operador) ─
 @router.post("/usuarios")
 async def crear_usuario(
     body: UsuarioIn,
     db:   AsyncSession = Depends(get_db),
     user: dict = Depends(require_roles("admin", "gerente"))
 ):
-    if body.rol not in ROLES_VALIDOS:
+    rol_final = body.rol
+    if user["rol"] == "gerente":
+        rol_final = "operador"  # un Gerente solo puede registrar Operadores
+    elif rol_final not in ROLES_VALIDOS:
         raise HTTPException(status_code=400, detail="Rol invalido")
-    if body.rol == "admin" and user["rol"] != "admin":
-        raise HTTPException(status_code=403, detail="Solo un Administrador puede crear otro Administrador")
 
     usu_norm = body.usuario.lower().strip()
     existe = await db.execute(select(Usuario).where(Usuario.usuario == usu_norm))
@@ -77,32 +81,31 @@ async def crear_usuario(
 
     nuevo = Usuario(
         usuario=usu_norm, password_hash=hashear_password(body.password.strip()),
-        rol=body.rol, activo=True, nombre_display=body.nombre_display or usu_norm
+        rol=rol_final, activo=True, nombre_display=body.nombre_display or usu_norm,
+        email=(body.email or "").strip().lower() or None
     )
     db.add(nuevo)
-    db.add(LogAcceso(usuario=user["sub"], accion="CREAR_USUARIO", detalle=f"Creo a {usu_norm} ({body.rol})", exito=True))
+    db.add(LogAcceso(usuario=user["sub"], accion="CREAR_USUARIO", detalle=f"Creo a {usu_norm} ({rol_final})", exito=True))
     await db.commit()
     return {"ok": True, "usuario": usu_norm}
 
-# ── EDITAR USUARIO ──────────────────────────────────────────────
+# ── EDITAR USUARIO (solo Admin) ─────────────────────────────────
 @router.patch("/usuarios/{usuario}")
 async def editar_usuario(
     usuario: str,
     body:    UsuarioEditIn,
     db:      AsyncSession = Depends(get_db),
-    user:    dict = Depends(require_roles("admin", "gerente"))
+    user:    dict = Depends(require_roles("admin"))
 ):
     result = await db.execute(select(Usuario).where(Usuario.usuario == usuario.lower().strip()))
     u = result.scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
-    # Un gerente no puede tocar ni ascender a cuentas de administrador
-    if (u.rol == "admin" or body.rol == "admin") and user["rol"] != "admin":
-        raise HTTPException(status_code=403, detail="Solo un Administrador puede modificar cuentas de Administrador")
-
     if body.nombre_display is not None:
         u.nombre_display = body.nombre_display
+    if body.email is not None:
+        u.email = body.email.strip().lower() or None
     if body.rol is not None:
         if body.rol not in ROLES_VALIDOS:
             raise HTTPException(status_code=400, detail="Rol invalido")
@@ -116,12 +119,12 @@ async def editar_usuario(
     await db.commit()
     return {"ok": True}
 
-# ── LOG DE ACCESOS / ACCIONES ────────────────────────────────────
+# ── LOG DE ACCESOS / ACCIONES (solo Admin) ──────────────────────
 @router.get("/logs")
 async def ver_logs(
     limite: int = 100,
     db:     AsyncSession = Depends(get_db),
-    user:   dict = Depends(require_roles("admin", "gerente"))
+    user:   dict = Depends(require_roles("admin"))
 ):
     result = await db.execute(select(LogAcceso).order_by(LogAcceso.fecha.desc()).limit(limite))
     return [{
