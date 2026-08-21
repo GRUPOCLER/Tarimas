@@ -7,7 +7,7 @@ from datetime import datetime
 import io, re, time
 
 from database import get_db
-from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso
+from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso, SolicitudReimpresion
 from services.auth import verificar_token
 
 router = APIRouter()
@@ -875,24 +875,80 @@ async def reabrir_entrega(
 
 # ── MARCAR IMPRESION (bloquea reimpresion a Operador) ───────────
 async def _controlar_impresion(db: AsyncSession, user: dict, veces_previas: int, motivo: str,
-                                tipo: str, referencia: str) -> bool:
-    """Primera impresion: libre. Reimpresion: solo Admin/Gerente y con motivo obligatorio."""
-    if veces_previas > 0:
-        if user.get("rol") not in ("admin", "gerente"):
-            raise HTTPException(
-                status_code=403,
-                detail="Este documento ya fue impreso. Se requiere autorizacion de un Gerente para reimprimir."
-            )
+                                tipo: str, referencia: str, id_entrega: str, num_entrega: str) -> bool:
+    """Primera impresion: libre para cualquiera.
+    Reimpresion:
+      - Admin/Gerente: pueden reimprimir directo, con motivo obligatorio (queda en bitacora).
+      - Operador: no puede reimprimir directo. Si ya tiene una solicitud APROBADA
+        para este mismo documento, se le permite (y se consume). Si no, se crea
+        una solicitud PENDIENTE con su motivo y se le informa que debe esperar
+        autorizacion de un Gerente.
+    """
+    if veces_previas == 0:
+        return True
+
+    if user.get("rol") in ("admin", "gerente"):
         if not (motivo or "").strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Debes indicar un motivo para justificar la reimpresion."
-            )
+            raise HTTPException(status_code=400, detail="Debes indicar un motivo para justificar la reimpresion.")
         db.add(LogAcceso(
             usuario=user["sub"], accion=f"REIMPRESION_{tipo}",
             detalle=f"{referencia} — motivo: {motivo.strip()}", exito=True
         ))
-    return True
+        return True
+
+    # Operador
+    aprobada = await db.execute(
+        select(SolicitudReimpresion).where(
+            SolicitudReimpresion.tipo == tipo,
+            SolicitudReimpresion.referencia == referencia,
+            SolicitudReimpresion.solicitado_por == user["sub"],
+            SolicitudReimpresion.estatus == "aprobada"
+        )
+    )
+    sol_aprobada = aprobada.scalars().first()
+    if sol_aprobada:
+        sol_aprobada.estatus = "usada"
+        return True
+
+    pendiente = await db.execute(
+        select(SolicitudReimpresion).where(
+            SolicitudReimpresion.tipo == tipo,
+            SolicitudReimpresion.referencia == referencia,
+            SolicitudReimpresion.solicitado_por == user["sub"],
+            SolicitudReimpresion.estatus == "pendiente"
+        )
+    )
+    if pendiente.scalars().first():
+        raise HTTPException(status_code=403, detail="Ya existe una solicitud pendiente de autorizacion para este documento.")
+
+    rechazada = await db.execute(
+        select(SolicitudReimpresion).where(
+            SolicitudReimpresion.tipo == tipo,
+            SolicitudReimpresion.referencia == referencia,
+            SolicitudReimpresion.solicitado_por == user["sub"],
+            SolicitudReimpresion.estatus == "rechazada"
+        ).order_by(SolicitudReimpresion.fecha_resolucion.desc())
+    )
+    sol_rechazada = rechazada.scalars().first()
+    if sol_rechazada and not (motivo or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail=f"Tu solicitud anterior fue rechazada" +
+                   (f" ({sol_rechazada.comentario_resolucion})" if sol_rechazada.comentario_resolucion else "") +
+                   ". Escribe un nuevo motivo para volver a solicitar."
+        )
+
+    if not (motivo or "").strip():
+        raise HTTPException(status_code=400, detail="Escribe el motivo de la reimpresion para enviar la solicitud.")
+
+    db.add(SolicitudReimpresion(
+        id=_gen_id_solicitud(), tipo=tipo, id_entrega=id_entrega, referencia=referencia,
+        num_entrega=num_entrega, motivo=motivo.strip(), solicitado_por=user["sub"], estatus="pendiente"
+    ))
+    raise HTTPException(status_code=403, detail="Solicitud enviada. Debe ser autorizada por un Gerente antes de imprimir.")
+
+def _gen_id_solicitud() -> str:
+    return f"SR-{int(time.time()*1000) % 100000000}"
 
 @router.post("/{id_entrega}/tarimas/{id_tarima}/marcar-impresa")
 async def marcar_impresa_tarima(
@@ -906,7 +962,10 @@ async def marcar_impresa_tarima(
     tarima = result.scalar_one_or_none()
     if not tarima:
         raise HTTPException(status_code=404, detail="Tarima no encontrada")
-    await _controlar_impresion(db, user, tarima.impresa_veces or 0, body.motivo, "TARIMA", id_tarima)
+    ent_r = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = ent_r.scalar_one_or_none()
+    await _controlar_impresion(db, user, tarima.impresa_veces or 0, body.motivo, "TARIMA", id_tarima,
+                                id_entrega, entrega.num_entrega if entrega else "")
     if not tarima.impresa_veces:
         tarima.primera_impresion_en  = datetime.utcnow()
         tarima.primera_impresion_por = user["sub"]
@@ -925,7 +984,8 @@ async def marcar_impresa_sueltas(
     entrega = result.scalar_one_or_none()
     if not entrega:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
-    await _controlar_impresion(db, user, entrega.etiquetas_sueltas_impresas_veces or 0, body.motivo, "SUELTAS", id_entrega)
+    await _controlar_impresion(db, user, entrega.etiquetas_sueltas_impresas_veces or 0, body.motivo,
+                                "SUELTAS", id_entrega, id_entrega, entrega.num_entrega)
     entrega.etiquetas_sueltas_impresas_veces = (entrega.etiquetas_sueltas_impresas_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": entrega.etiquetas_sueltas_impresas_veces}
@@ -941,11 +1001,11 @@ async def marcar_impreso_packing(
     entrega = result.scalar_one_or_none()
     if not entrega:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
-    await _controlar_impresion(db, user, entrega.packing_impreso_veces or 0, body.motivo, "PACKING", id_entrega)
+    await _controlar_impresion(db, user, entrega.packing_impreso_veces or 0, body.motivo,
+                                "PACKING", id_entrega, id_entrega, entrega.num_entrega)
     entrega.packing_impreso_veces = (entrega.packing_impreso_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": entrega.packing_impreso_veces}
-
 
 # ── SERIALIZERS ───────────────────────────────────────────────
 def _serializar_entrega(e: Entrega) -> dict:
@@ -962,6 +1022,8 @@ def _serializar_entrega(e: Entrega) -> dict:
         "comercializador":e.comercializador,
         "sucursal":       e.sucursal,
         "fuente":         e.fuente,
+        "etiquetas_sueltas_impresas_veces": e.etiquetas_sueltas_impresas_veces or 0,
+        "packing_impreso_veces":            e.packing_impreso_veces or 0,
     }
 
 def _ser_prod(p: Producto) -> dict:
@@ -1002,5 +1064,6 @@ def _ser_tarima(t: Tarima, detalles: list = None) -> dict:
         "largo_cm":       t.largo_cm or 0,
         "ancho_cm":       t.ancho_cm or 0,
         "alto_cm":        t.alto_cm or 0,
+        "impresa_veces":  t.impresa_veces or 0,
         "productos":      [_ser_detalle(d) for d in (detalles or [])],
     }
