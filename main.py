@@ -7,7 +7,7 @@ from sqlalchemy import text
 load_dotenv()
 
 from database import engine, Base
-from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin
+from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin, reimpresiones
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -106,6 +106,7 @@ app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"]
 app.include_router(setup.router,     prefix="/api/setup",     tags=["setup"])
 app.include_router(odoo.router,      prefix="/api/odoo",      tags=["odoo"])
 app.include_router(admin.router,     prefix="/api/admin",     tags=["admin"])
+app.include_router(reimpresiones.router, prefix="/api/reimpresiones", tags=["reimpresiones"])
 
 @app.get("/")
 def root():
