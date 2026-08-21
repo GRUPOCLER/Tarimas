@@ -339,6 +339,7 @@ async def procesar_pdf(
     contenido = await archivo.read()
     from parsers.ecor import parsear_ecor
     from parsers.sap_raiker import parsear_sap_raiker
+    from parsers.traspaso_raiker import parsear_traspaso_raiker
     from parsers.detector import detectar_tipo
 
     texto = _extraer_texto_pdf(contenido)
@@ -346,6 +347,8 @@ async def procesar_pdf(
 
     if tipo == "SAP_RAIKER":
         datos = parsear_sap_raiker(texto, archivo.filename)
+    elif tipo == "TRASPASO_RAIKER":
+        datos = parsear_traspaso_raiker(texto)
     else:
         datos = parsear_ecor(texto)
 
