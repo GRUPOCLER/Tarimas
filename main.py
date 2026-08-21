@@ -75,6 +75,7 @@ async def lifespan(app: FastAPI):
         "ALTER TABLE usuarios ALTER COLUMN rol SET DEFAULT 'operador'",
         "UPDATE usuarios SET rol = 'operador' WHERE rol = 'editor'",
         "DROP TYPE IF EXISTS rolenum",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS email VARCHAR(120)",
     ]:
         try:
             async with engine.begin() as conn2:
