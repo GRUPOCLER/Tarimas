@@ -7,7 +7,7 @@ from datetime import datetime
 import io, re, time
 
 from database import get_db
-from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega
+from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso
 from services.auth import verificar_token
 
 router = APIRouter()
@@ -94,6 +94,9 @@ class DimensionesIn(BaseModel):
     largo_cm: float = 0
     ancho_cm: float = 0
     alto_cm:  float = 0
+
+class MarcarImpresoIn(BaseModel):
+    motivo: Optional[str] = None
 
 class ExtensionIn(BaseModel):
     cantidad: int
@@ -871,20 +874,31 @@ async def reabrir_entrega(
     return {"ok": True}
 
 # ── MARCAR IMPRESION (bloquea reimpresion a Operador) ───────────
-async def _controlar_impresion(user: dict, veces_previas: int) -> bool:
-    """Retorna True si se permite imprimir. Si ya se imprimio antes,
-    solo Admin/Gerente pueden volver a hacerlo."""
-    if veces_previas > 0 and user.get("rol") not in ("admin", "gerente"):
-        raise HTTPException(
-            status_code=403,
-            detail="Este documento ya fue impreso. Se requiere autorizacion de un Gerente para reimprimir."
-        )
+async def _controlar_impresion(db: AsyncSession, user: dict, veces_previas: int, motivo: str,
+                                tipo: str, referencia: str) -> bool:
+    """Primera impresion: libre. Reimpresion: solo Admin/Gerente y con motivo obligatorio."""
+    if veces_previas > 0:
+        if user.get("rol") not in ("admin", "gerente"):
+            raise HTTPException(
+                status_code=403,
+                detail="Este documento ya fue impreso. Se requiere autorizacion de un Gerente para reimprimir."
+            )
+        if not (motivo or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Debes indicar un motivo para justificar la reimpresion."
+            )
+        db.add(LogAcceso(
+            usuario=user["sub"], accion=f"REIMPRESION_{tipo}",
+            detalle=f"{referencia} — motivo: {motivo.strip()}", exito=True
+        ))
     return True
 
 @router.post("/{id_entrega}/tarimas/{id_tarima}/marcar-impresa")
 async def marcar_impresa_tarima(
     id_entrega: str,
     id_tarima:  str,
+    body:       MarcarImpresoIn = MarcarImpresoIn(),
     db:         AsyncSession = Depends(get_db),
     user:       dict = Depends(get_current_user)
 ):
@@ -892,7 +906,7 @@ async def marcar_impresa_tarima(
     tarima = result.scalar_one_or_none()
     if not tarima:
         raise HTTPException(status_code=404, detail="Tarima no encontrada")
-    await _controlar_impresion(user, tarima.impresa_veces or 0)
+    await _controlar_impresion(db, user, tarima.impresa_veces or 0, body.motivo, "TARIMA", id_tarima)
     if not tarima.impresa_veces:
         tarima.primera_impresion_en  = datetime.utcnow()
         tarima.primera_impresion_por = user["sub"]
@@ -903,6 +917,7 @@ async def marcar_impresa_tarima(
 @router.post("/{id_entrega}/etiquetas-sueltas/marcar-impresa")
 async def marcar_impresa_sueltas(
     id_entrega: str,
+    body:       MarcarImpresoIn = MarcarImpresoIn(),
     db:         AsyncSession = Depends(get_db),
     user:       dict = Depends(get_current_user)
 ):
@@ -910,7 +925,7 @@ async def marcar_impresa_sueltas(
     entrega = result.scalar_one_or_none()
     if not entrega:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
-    await _controlar_impresion(user, entrega.etiquetas_sueltas_impresas_veces or 0)
+    await _controlar_impresion(db, user, entrega.etiquetas_sueltas_impresas_veces or 0, body.motivo, "SUELTAS", id_entrega)
     entrega.etiquetas_sueltas_impresas_veces = (entrega.etiquetas_sueltas_impresas_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": entrega.etiquetas_sueltas_impresas_veces}
@@ -918,6 +933,7 @@ async def marcar_impresa_sueltas(
 @router.post("/{id_entrega}/packing/marcar-impreso")
 async def marcar_impreso_packing(
     id_entrega: str,
+    body:       MarcarImpresoIn = MarcarImpresoIn(),
     db:         AsyncSession = Depends(get_db),
     user:       dict = Depends(get_current_user)
 ):
@@ -925,10 +941,11 @@ async def marcar_impreso_packing(
     entrega = result.scalar_one_or_none()
     if not entrega:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
-    await _controlar_impresion(user, entrega.packing_impreso_veces or 0)
+    await _controlar_impresion(db, user, entrega.packing_impreso_veces or 0, body.motivo, "PACKING", id_entrega)
     entrega.packing_impreso_veces = (entrega.packing_impreso_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": entrega.packing_impreso_veces}
+
 
 # ── SERIALIZERS ───────────────────────────────────────────────
 def _serializar_entrega(e: Entrega) -> dict:
