@@ -30,6 +30,17 @@ def require_roles(*roles):
 class ResolucionIn(BaseModel):
     comentario: Optional[str] = None
 
+@router.get("/pendientes-count")
+async def contar_pendientes(
+    db:   AsyncSession = Depends(get_db),
+    user: dict = Depends(require_roles("admin", "gerente"))
+):
+    from sqlalchemy import func as sa_func
+    result = await db.execute(
+        select(sa_func.count(SolicitudReimpresion.id)).where(SolicitudReimpresion.estatus == "pendiente")
+    )
+    return {"pendientes": result.scalar() or 0}
+
 def _gen_id_solicitud() -> str:
     return f"SR-{int(time.time()*1000) % 100000000}"
 
