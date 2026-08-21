@@ -25,6 +25,7 @@ class Usuario(Base):
     __tablename__ = "usuarios"
     id             = Column(String, primary_key=True, default=gen_id)
     usuario        = Column(String(50), unique=True, nullable=False, index=True)
+    email          = Column(String(120), nullable=True, index=True)
     password_hash  = Column(String(64), nullable=False)
     rol            = Column(String(20), default="operador")  # admin | gerente | operador
     activo         = Column(Boolean, default=True)
