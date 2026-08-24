@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header
+-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from pydantic import BaseModel
@@ -128,15 +128,21 @@ def _numero_tarima(id_tarima: str) -> int:
 # ── LISTAR ENTREGAS ───────────────────────────────────────────
 @router.get("/")
 async def listar_entregas(
-    sistema:  Optional[str] = None,
-    estatus:  Optional[str] = None,
-    limite:   int = 50,
-    db:       AsyncSession = Depends(get_db),
-    user:     dict = Depends(get_current_user)
+    sistema:      Optional[str] = None,
+    estatus:      Optional[str] = None,
+    fuente:       Optional[str] = None,
+    fecha_desde:  Optional[str] = None,
+    fecha_hasta:  Optional[str] = None,
+    limite:       int = 200,
+    db:           AsyncSession = Depends(get_db),
+    user:         dict = Depends(get_current_user)
 ):
     q = select(Entrega).order_by(Entrega.fecha_creacion.desc()).limit(limite)
     if sistema: q = q.where(Entrega.sistema == sistema)
     if estatus: q = q.where(Entrega.estatus == estatus)
+    if fuente:  q = q.where(Entrega.fuente == fuente)
+    if fecha_desde: q = q.where(func.date(Entrega.fecha_creacion) >= fecha_desde)
+    if fecha_hasta: q = q.where(func.date(Entrega.fecha_creacion) <= fecha_hasta)
     result = await db.execute(q)
     entregas = result.scalars().all()
 
