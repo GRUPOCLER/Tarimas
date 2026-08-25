@@ -582,6 +582,16 @@ async def etiqueta_tarima(
     todas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
     total_tarimas = len(todas.scalars().all())
 
+    # Para MIX: el conteo de bultos combina tarimas + carga suelta pendiente,
+    # ya que ambos son "bultos" fisicos que suben al mismo embarque
+    es_mix = entrega.sistema == "MIX"
+    total_bultos = total_tarimas
+    if es_mix:
+        prods_r2 = await db.execute(select(Producto).where(Producto.id_entrega == id_entrega))
+        pend = [p for p in prods_r2.scalars()
+                if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
+        total_bultos = total_tarimas + len(pend)
+
     detalles_r = await db.execute(select(DetalleTarima).where(DetalleTarima.id_tarima == id_tarima))
     productos = [{
         "id_producto":    d.id_producto,
@@ -603,6 +613,8 @@ async def etiqueta_tarima(
         "id_tarima":       tarima.id_tarima,
         "numero_tarima":   numero_tarima,
         "total_tarimas":   total_tarimas,
+        "es_mix":          es_mix,
+        "total_bultos":    total_bultos,
         "id_entrega":      entrega.id_entrega,
         "num_entrega":     entrega.num_entrega,
         "nombre_cliente":  entrega.nombre_cliente,
@@ -651,6 +663,15 @@ async def etiquetas_sueltas(
     barcode_entrega = folio_limpio
     barcode_url = _barcode_url(barcode_entrega)
 
+    # Para MIX: la numeracion de bultos continua despues de las tarimas ya
+    # cerradas (que ya se contaron como bultos 1..N en sus propias etiquetas)
+    offset = 0
+    if entrega.sistema == "MIX":
+        tars_r = await db.execute(
+            select(func.count(Tarima.id_tarima)).where(Tarima.id_entrega == id_entrega, Tarima.estatus == "cerrada")
+        )
+        offset = tars_r.scalar() or 0
+
     total_skus = len(productos)
     total_piezas = sum(p.cantidad_pendiente for p in productos)
 
@@ -666,8 +687,9 @@ async def etiquetas_sueltas(
             "descripcion":         p.descripcion,
             "cantidad":            cant,
             "unidad":              p.unidad,
-            "num_sku":             i,
-            "total_skus_entrega":  total_skus,
+            "num_sku":             offset + i,
+            "total_skus_entrega":  offset + total_skus,
+            "es_mix":              entrega.sistema == "MIX",
             "pieza_inicio":        pieza_inicio,
             "total_piezas_entrega":total_piezas,
             "num_entrega":         entrega.num_entrega,
