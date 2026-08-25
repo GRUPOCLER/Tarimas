@@ -7,6 +7,10 @@ def detectar_tipo(texto: str) -> str:
     if 'RETAILONE' in t_completo.replace(' ', '') and \
        ('SALIDA POR TRASPASO' in t_completo or 'ENTRADA POR TRASPASO' in t_completo):
         return 'TRASPASO_RAIKER'
+    # Factura CFDI de ECOR — chequear ANTES de la nota de entrega generica,
+    # ya que ambas comparten "EQUIPOS COREANOS" en el encabezado
+    if 'EQUIPOS COREANOS' in t_completo and 'FOLIO FISCAL' in t_completo and 'CONCEPTOS' in t_completo:
+        return 'FACTURA_ECOR'
     # ECOR siempre primero
     if re.search(r'[A-Z]{2,6}-[A-Z]{2,6}/OUT/\d+', muestra) or \
        'EQUIPOS COREANOS' in muestra or 'ECOR.MX' in muestra:
