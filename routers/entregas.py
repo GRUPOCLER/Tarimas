@@ -586,7 +586,7 @@ async def etiqueta_tarima(
     if not tarima:
         raise HTTPException(status_code=404, detail="Tarima no encontrada")
 
-    todas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
+    todas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega, Tarima.estatus == "cerrada"))
     total_tarimas = len(todas.scalars().all())
 
     # Para MIX: el conteo de bultos combina tarimas + carga suelta pendiente,
@@ -736,10 +736,11 @@ async def lista_empaque(
     if not entrega:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
 
-    tarimas = await _tarimas_relacionadas(db, id_entrega)
+    tarimas_todas = await _tarimas_relacionadas(db, id_entrega)
+    tarimas = [t for t in tarimas_todas if t.estatus == "cerrada"]
 
     ids_involucrados = {id_entrega}
-    for t in tarimas:
+    for t in tarimas_todas:
         ids_involucrados.add(t.id_entrega)
         if t.ids_entregas_fusionadas:
             ids_involucrados |= set(t.ids_entregas_fusionadas.split(","))
@@ -754,13 +755,34 @@ async def lista_empaque(
     ) if tarimas_ids else None
     detalles = list(detalles_r.scalars()) if detalles_r else []
 
+    tarimas_ordenadas = sorted(tarimas, key=lambda x: _numero_tarima(x.id_tarima))
+    total_tarimas_cerradas = len(tarimas_ordenadas)
+
+    # Productos sueltos (sin tarima): en CS son todos; en MIX solo lo pendiente
+    prods_r = await db.execute(select(Producto).where(Producto.id_entrega.in_(list(ids_involucrados))))
+    todos_prods = list(prods_r.scalars())
+    if entrega.sistema == "CS":
+        sueltos_prods = [p for p in todos_prods if p.cantidad_total > 0]
+    else:
+        sueltos_prods = [p for p in todos_prods
+                          if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
+
+    # Numeracion combinada: en MIX, tarimas ocupan 1..T y sueltos continuan T+1..T+S
+    es_mix = entrega.sistema == "MIX"
+    offset_sueltos = total_tarimas_cerradas if es_mix else 0
+    total_bultos = total_tarimas_cerradas if not es_mix and entrega.sistema == "TAR" else \
+                   len(sueltos_prods) if entrega.sistema == "CS" else \
+                   total_tarimas_cerradas + len(sueltos_prods)
+
     tarimas_data = []
-    for t in sorted(tarimas, key=lambda x: _numero_tarima(x.id_tarima)):
+    for t in tarimas_ordenadas:
         det = [d for d in detalles if d.id_tarima == t.id_tarima]
         piezas = sum(d.cantidad_asignada for d in det)
         tarimas_data.append({
             "id_tarima":     t.id_tarima,
             "numero_tarima": _numero_tarima(t.id_tarima),
+            "numero_bulto":  _numero_tarima(t.id_tarima),
+            "total_bultos":  total_bultos,
             "estatus":       t.estatus,
             "peso_palet_kg": t.peso_palet_kg or 0,
             "largo_cm":      t.largo_cm or 0,
@@ -770,17 +792,15 @@ async def lista_empaque(
             "productos":     [_ser_detalle(d) for d in det],
         })
 
-    # Productos sueltos (sin tarima): en CS son todos; en MIX solo lo pendiente
-    prods_r = await db.execute(select(Producto).where(Producto.id_entrega.in_(list(ids_involucrados))))
-    todos_prods = list(prods_r.scalars())
-    if entrega.sistema == "CS":
-        sueltos_data = [_ser_prod(p) for p in todos_prods if p.cantidad_total > 0]
-    else:
-        sueltos_data = [_ser_prod(p) for p in todos_prods
-                         if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
+    sueltos_data = []
+    for i, p in enumerate(sueltos_prods, 1):
+        s = _ser_prod(p)
+        s["numero_bulto"] = offset_sueltos + i
+        s["total_bultos"] = total_bultos
+        sueltos_data.append(s)
 
     if not tarimas_data and not sueltos_data:
-        raise HTTPException(status_code=404, detail="No hay productos ni tarimas para generar la lista de empaque")
+        raise HTTPException(status_code=404, detail="No hay productos ni tarimas cerradas para generar la lista de empaque")
 
     total_piezas_sueltos = sum(
         (p["cantidad_pendiente"] if entrega.sistema != "CS" else p["cantidad_total"]) for p in sueltos_data
@@ -791,11 +811,12 @@ async def lista_empaque(
     return {
         "entrega":              _serializar_entrega(entrega),
         "es_fusion":            es_fusion,
+        "es_mix":               es_mix,
         "entregas_involucradas":entregas_involucradas,
         "remitente":            _remitente(entrega.comercializador),
         "tarimas":              tarimas_data,
         "sueltos":              sueltos_data,
-        "total_bultos":         len(tarimas_data),
+        "total_bultos":         total_bultos,
         "total_piezas":         sum(t["total_piezas"] for t in tarimas_data) + total_piezas_sueltos,
         "total_piezas_sueltos": total_piezas_sueltos,
         "peso_palet_total_kg":  round(sum(t["peso_palet_kg"] for t in tarimas_data), 2),
@@ -810,10 +831,10 @@ async def todas_etiquetas(
     db:         AsyncSession = Depends(get_db),
     user:       dict = Depends(get_current_user)
 ):
-    tarimas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega))
+    tarimas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega, Tarima.estatus == "cerrada"))
     ids = [t.id_tarima for t in tarimas.scalars()]
     if not ids:
-        raise HTTPException(status_code=404, detail="Esta entrega no tiene tarimas")
+        raise HTTPException(status_code=404, detail="Esta entrega no tiene tarimas cerradas")
     resultado = []
     for id_t in ids:
         resultado.append(await etiqueta_tarima(id_entrega, id_t, db, user))
