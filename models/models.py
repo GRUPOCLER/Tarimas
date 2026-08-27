@@ -152,3 +152,19 @@ class SolicitudReimpresion(Base):
     autorizado_por         = Column(String(50), nullable=True)
     fecha_resolucion       = Column(DateTime, nullable=True)
     comentario_resolucion  = Column(Text, nullable=True)
+
+# ── SOLICITUDES DE CAMBIO DE SISTEMA (TAR/CS/MIX) ───────────────
+class SolicitudCambioSistema(Base):
+    __tablename__ = "solicitudes_cambio_sistema"
+    id                     = Column(String(35), primary_key=True)
+    id_entrega             = Column(String(20), index=True)
+    num_entrega            = Column(String(60))
+    sistema_actual         = Column(String(10))
+    sistema_nuevo          = Column(String(10))
+    motivo                 = Column(Text)
+    solicitado_por         = Column(String(50))
+    fecha_solicitud        = Column(DateTime, server_default=func.now())
+    estatus                = Column(String(20), default="pendiente")  # pendiente | aprobada | rechazada
+    autorizado_por         = Column(String(50), nullable=True)
+    fecha_resolucion       = Column(DateTime, nullable=True)
+    comentario_resolucion  = Column(Text, nullable=True)
