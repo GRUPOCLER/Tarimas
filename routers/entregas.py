@@ -7,7 +7,7 @@ from datetime import datetime
 import io, re, time
 
 from database import get_db
-from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso, SolicitudReimpresion
+from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso, SolicitudReimpresion, SolicitudCambioSistema
 from services.auth import verificar_token
 
 router = APIRouter()
@@ -97,6 +97,10 @@ class DimensionesIn(BaseModel):
 
 class MarcarImpresoIn(BaseModel):
     motivo: Optional[str] = None
+
+class CambioSistemaIn(BaseModel):
+    sistema_nuevo: str
+    motivo: str
 
 class ExtensionIn(BaseModel):
     cantidad: int
@@ -908,6 +912,63 @@ async def reabrir_entrega(
     entrega.estatus = "pendiente"
     await db.commit()
     return {"ok": True}
+
+def _gen_id_cambio() -> str:
+    return f"SC-{int(time.time()*1000) % 100000000}"
+
+# ── SOLICITAR CAMBIO DE SISTEMA (TAR/CS/MIX) ────────────────────
+@router.post("/{id_entrega}/solicitar-cambio-sistema")
+async def solicitar_cambio_sistema(
+    id_entrega: str,
+    body:       CambioSistemaIn,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    if body.sistema_nuevo not in ("TAR", "CS", "MIX"):
+        raise HTTPException(status_code=400, detail="Sistema invalido")
+    if not (body.motivo or "").strip():
+        raise HTTPException(status_code=400, detail="Escribe el motivo de la correccion")
+
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+    if entrega.sistema == body.sistema_nuevo:
+        raise HTTPException(status_code=400, detail="La entrega ya esta clasificada como " + body.sistema_nuevo)
+
+    sistema_anterior = entrega.sistema
+
+    if user.get("rol") in ("admin", "gerente"):
+        # Admin/Gerente aplican el cambio directo, queda registrado igual
+        entrega.sistema = body.sistema_nuevo
+        db.add(SolicitudCambioSistema(
+            id=_gen_id_cambio(), id_entrega=id_entrega, num_entrega=entrega.num_entrega,
+            sistema_actual=sistema_anterior, sistema_nuevo=body.sistema_nuevo,
+            motivo=body.motivo.strip(), solicitado_por=user["sub"],
+            estatus="aprobada", autorizado_por=user["sub"], fecha_resolucion=datetime.utcnow()
+        ))
+        db.add(LogAcceso(usuario=user["sub"], accion="CAMBIO_SISTEMA",
+                          detalle=f"{id_entrega}: {sistema_anterior} -> {body.sistema_nuevo} — {body.motivo.strip()}", exito=True))
+        await db.commit()
+        return {"ok": True, "aplicado": True}
+
+    # Operador: solo puede solicitar, requiere autorizacion
+    pendiente = await db.execute(
+        select(SolicitudCambioSistema).where(
+            SolicitudCambioSistema.id_entrega == id_entrega,
+            SolicitudCambioSistema.estatus == "pendiente"
+        )
+    )
+    if pendiente.scalars().first():
+        raise HTTPException(status_code=403, detail="Ya existe una solicitud de cambio pendiente para esta entrega.")
+
+    db.add(SolicitudCambioSistema(
+        id=_gen_id_cambio(), id_entrega=id_entrega, num_entrega=entrega.num_entrega,
+        sistema_actual=sistema_anterior, sistema_nuevo=body.sistema_nuevo,
+        motivo=body.motivo.strip(), solicitado_por=user["sub"], estatus="pendiente"
+    ))
+    await db.commit()
+    raise HTTPException(status_code=403, detail="Solicitud enviada. Debe ser autorizada por un Gerente.")
 
 # ── MARCAR IMPRESION (bloquea reimpresion a Operador) ───────────
 async def _controlar_impresion(db: AsyncSession, user: dict, veces_previas: int, motivo: str,
