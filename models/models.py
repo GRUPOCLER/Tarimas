@@ -168,3 +168,15 @@ class SolicitudCambioSistema(Base):
     autorizado_por         = Column(String(50), nullable=True)
     fecha_resolucion       = Column(DateTime, nullable=True)
     comentario_resolucion  = Column(Text, nullable=True)
+
+# ── ALMACENES DE TRASPASO CONFIGURADOS (destinos a vigilar en Odoo) ─
+class AlmacenTraspaso(Base):
+    __tablename__ = "almacenes_traspaso"
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    odoo_warehouse_id  = Column(Integer, nullable=False)
+    odoo_location_id   = Column(Integer, nullable=False)  # view_location_id, para el filtro child_of
+    nombre             = Column(String(120))
+    codigo             = Column(String(30))
+    activo             = Column(Boolean, default=True)
+    agregado_por       = Column(String(50))
+    fecha_agregado     = Column(DateTime, server_default=func.now())
