@@ -137,6 +137,7 @@ async def listar_entregas(
     fuente:       Optional[str] = None,
     fecha_desde:  Optional[str] = None,
     fecha_hasta:  Optional[str] = None,
+    buscar:       Optional[str] = None,
     limite:       int = 200,
     db:           AsyncSession = Depends(get_db),
     user:         dict = Depends(get_current_user)
@@ -147,6 +148,11 @@ async def listar_entregas(
     if fuente:  q = q.where(Entrega.fuente == fuente)
     if fecha_desde: q = q.where(func.date(Entrega.fecha_creacion) >= fecha_desde)
     if fecha_hasta: q = q.where(func.date(Entrega.fecha_creacion) <= fecha_hasta)
+    if buscar:
+        patron = f"%{buscar.strip()}%"
+        q = q.where(
+            Entrega.num_entrega.ilike(patron) | Entrega.orden.ilike(patron)
+        )
     result = await db.execute(q)
     entregas = result.scalars().all()
 
