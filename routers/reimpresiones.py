@@ -132,3 +132,96 @@ def _ser(s: SolicitudReimpresion) -> dict:
         "fecha_resolucion":       str(s.fecha_resolucion or ""),
         "comentario_resolucion":  s.comentario_resolucion,
     }
+
+# ── CAMBIOS DE SISTEMA (TAR/CS/MIX) ─────────────────────────────
+from models.models import SolicitudCambioSistema
+
+@router.get("/cambios-sistema/pendientes-count")
+async def contar_pendientes_cambios(
+    db:   AsyncSession = Depends(get_db),
+    user: dict = Depends(require_roles("admin", "gerente"))
+):
+    from sqlalchemy import func as sa_func
+    result = await db.execute(
+        select(sa_func.count(SolicitudCambioSistema.id)).where(SolicitudCambioSistema.estatus == "pendiente")
+    )
+    return {"pendientes": result.scalar() or 0}
+
+@router.get("/cambios-sistema")
+async def listar_cambios_sistema(
+    estatus: Optional[str] = None,
+    db:      AsyncSession = Depends(get_db),
+    user:    dict = Depends(require_roles("admin", "gerente"))
+):
+    q = select(SolicitudCambioSistema).order_by(SolicitudCambioSistema.fecha_solicitud.desc())
+    if estatus:
+        q = q.where(SolicitudCambioSistema.estatus == estatus)
+    result = await db.execute(q)
+    return [_ser_cambio(s) for s in result.scalars()]
+
+@router.post("/cambios-sistema/{id_solicitud}/aprobar")
+async def aprobar_cambio_sistema(
+    id_solicitud: str,
+    body:         ResolucionIn,
+    db:           AsyncSession = Depends(get_db),
+    user:         dict = Depends(require_roles("admin", "gerente"))
+):
+    from models.models import Entrega
+    result = await db.execute(select(SolicitudCambioSistema).where(SolicitudCambioSistema.id == id_solicitud))
+    s = result.scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    if s.estatus != "pendiente":
+        raise HTTPException(status_code=400, detail="Esta solicitud ya fue resuelta")
+
+    ent_r = await db.execute(select(Entrega).where(Entrega.id_entrega == s.id_entrega))
+    entrega = ent_r.scalar_one_or_none()
+    if entrega:
+        entrega.sistema = s.sistema_nuevo
+
+    s.estatus = "aprobada"
+    s.autorizado_por = user["sub"]
+    s.fecha_resolucion = datetime.utcnow()
+    s.comentario_resolucion = body.comentario
+    db.add(LogAcceso(usuario=user["sub"], accion="APROBAR_CAMBIO_SISTEMA",
+                      detalle=f"{s.id_entrega}: {s.sistema_actual} -> {s.sistema_nuevo}", exito=True))
+    await db.commit()
+    return {"ok": True}
+
+@router.post("/cambios-sistema/{id_solicitud}/rechazar")
+async def rechazar_cambio_sistema(
+    id_solicitud: str,
+    body:         ResolucionIn,
+    db:           AsyncSession = Depends(get_db),
+    user:         dict = Depends(require_roles("admin", "gerente"))
+):
+    result = await db.execute(select(SolicitudCambioSistema).where(SolicitudCambioSistema.id == id_solicitud))
+    s = result.scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    if s.estatus != "pendiente":
+        raise HTTPException(status_code=400, detail="Esta solicitud ya fue resuelta")
+    s.estatus = "rechazada"
+    s.autorizado_por = user["sub"]
+    s.fecha_resolucion = datetime.utcnow()
+    s.comentario_resolucion = body.comentario
+    db.add(LogAcceso(usuario=user["sub"], accion="RECHAZAR_CAMBIO_SISTEMA",
+                      detalle=f"{s.id_entrega}: {s.sistema_actual} -> {s.sistema_nuevo}", exito=True))
+    await db.commit()
+    return {"ok": True}
+
+def _ser_cambio(s: SolicitudCambioSistema) -> dict:
+    return {
+        "id":                     s.id,
+        "id_entrega":             s.id_entrega,
+        "num_entrega":            s.num_entrega,
+        "sistema_actual":         s.sistema_actual,
+        "sistema_nuevo":          s.sistema_nuevo,
+        "motivo":                 s.motivo,
+        "solicitado_por":         s.solicitado_por,
+        "fecha_solicitud":        str(s.fecha_solicitud or ""),
+        "estatus":                s.estatus,
+        "autorizado_por":         s.autorizado_por,
+        "fecha_resolucion":       str(s.fecha_resolucion or ""),
+        "comentario_resolucion":  s.comentario_resolucion,
+    }
