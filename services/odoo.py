@@ -128,8 +128,8 @@ async def listar_traspasos_pendientes(ubicaciones: list = None):
         return []
     pickings = await _rpc("stock.picking", "search_read",
         [[
-            ["picking_type_id.code", "=", "internal"],
             ["location_dest_id", "child_of", ubicaciones],
+            ["location_id.usage", "in", ["internal", "transit"]],
             ["state", "not in", ["done", "cancel"]]
         ]],
         {
