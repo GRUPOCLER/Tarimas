@@ -148,6 +148,29 @@ async def listar_traspasos_pendientes(ubicaciones: list = None):
         "move_ids":   p["move_ids"]
     } for p in pickings]
 
+async def diag_traspasos(ubicaciones: list = None):
+    """Sin filtro de tipo de operacion ni de estatus — para ver que hay
+    realmente en esas ubicaciones antes de decidir el filtro final."""
+    ubicaciones = ubicaciones if ubicaciones is not None else DESTINOS_TRASPASO
+    if not ubicaciones:
+        return []
+    pickings = await _rpc("stock.picking", "search_read",
+        [[["location_dest_id", "child_of", ubicaciones]]],
+        {
+            "fields": ["name", "location_id", "location_dest_id", "state", "picking_type_id", "origin", "scheduled_date"],
+            "order": "id desc", "limit": 40
+        }
+    )
+    return [{
+        "folio":         p["name"],
+        "origen":        p["location_id"][1] if p.get("location_id") else "",
+        "destino":       p["location_dest_id"][1] if p.get("location_dest_id") else "",
+        "estado":        p["state"],
+        "tipo_operacion":p["picking_type_id"][1] if p.get("picking_type_id") else "",
+        "referencia":    p.get("origin") or "",
+        "fecha":         (p.get("scheduled_date") or "")[:10],
+    } for p in pickings]
+
 async def buscar_almacenes(nombre: str = ""):
     """Busca almacenes reales en Odoo para que el admin elija cuales vigilar."""
     dominio = [["name", "ilike", nombre]] if nombre else []
