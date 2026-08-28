@@ -81,6 +81,19 @@ async def cargar_traspaso(picking_id: int, user: dict = Depends(get_current_user
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+@router.get("/diag/traspasos")
+async def diag_traspasos(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Ve TODO lo que llega a los almacenes configurados, sin filtrar por
+    tipo de operacion ni estatus — para ajustar el filtro real con datos."""
+    if user.get("rol") not in ("admin", "gerente"):
+        raise HTTPException(status_code=403, detail="Requiere admin o gerente")
+    result = await db.execute(select(AlmacenTraspaso.odoo_location_id).where(AlmacenTraspaso.activo == True))
+    ubicaciones = [row[0] for row in result.all()]
+    try:
+        return {"ubicaciones_configuradas": ubicaciones, "resultados": await odoo_svc.diag_traspasos(ubicaciones or None)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
 # ── ADMINISTRACION DE ALMACENES DE TRASPASO (solo Admin) ────────────
 @router.get("/almacenes-disponibles")
 async def buscar_almacenes_odoo(nombre: str = "", user: dict = Depends(get_current_user)):
