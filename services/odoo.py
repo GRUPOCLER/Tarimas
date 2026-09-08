@@ -1,4 +1,5 @@
 import os, re, httpx
+from datetime import datetime, timedelta
 
 ODOO_URL      = os.getenv("ODOO_URL", "")
 ODOO_DB       = os.getenv("ODOO_DB", "")
@@ -75,8 +76,9 @@ async def _uid(client: httpx.AsyncClient):
     return uid
 
 async def listar_ovs_pendientes():
+    fecha_limite = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
     ovs = await _rpc("sale.order", "search_read",
-        [[["picking_ids", "!=", False], ["state", "in", ["sale", "done"]]]],
+        [[["picking_ids", "!=", False], ["state", "in", ["sale", "done"]], ["date_order", ">=", fecha_limite]]],
         {"fields": ["name", "partner_id", "state", "picking_ids", "date_order"], "order": "id desc", "limit": 60}
     )
     return [{
@@ -111,11 +113,41 @@ async def cargar_entrega(picking_ids: list):
             "clave": clave, "descripcion": desc,
             "cantidad_total": round(m["product_uom_qty"]), "unidad": "PZA"
         })
+
+    # Direccion de entrega real: viene del campo "partner_shipping_id" de la
+    # orden de venta (Odoo estandar), no del cliente general de la OV.
+    direccion = p["partner_id"][1] if p.get("partner_id") else ""
+    if p.get("sale_id"):
+        try:
+            ov = await _rpc("sale.order", "search_read",
+                [[["id", "=", p["sale_id"][0]]]],
+                {"fields": ["partner_shipping_id"]}
+            )
+            if ov and ov[0].get("partner_shipping_id"):
+                id_envio = ov[0]["partner_shipping_id"][0]
+                contactos = await _rpc("res.partner", "search_read",
+                    [[["id", "=", id_envio]]],
+                    {"fields": ["street", "street2", "city", "state_id", "zip", "country_id"]}
+                )
+                if contactos:
+                    c = contactos[0]
+                    partes = [
+                        c.get("street"), c.get("street2"), c.get("city"),
+                        c["state_id"][1] if c.get("state_id") else None,
+                        c.get("zip"),
+                        c["country_id"][1] if c.get("country_id") else None,
+                    ]
+                    direccion_armada = ", ".join(x for x in partes if x)
+                    if direccion_armada:
+                        direccion = direccion_armada
+        except Exception:
+            pass  # si algo falla, se queda con el nombre del cliente como respaldo
+
     return {
         "num_entrega": p["name"],
         "orden": p["sale_id"][1] if p.get("sale_id") else "",
         "nombre_cliente": p["partner_id"][1] if p.get("partner_id") else "",
-        "direccion": p["partner_id"][1] if p.get("partner_id") else "",
+        "direccion": direccion,
         "comercializador": PARTNER_MAP.get(p["partner_id"][0] if p.get("partner_id") else None, ""),
         "fuente": "odoo",
         "productos": productos
@@ -130,7 +162,8 @@ async def listar_traspasos_pendientes(ubicaciones: list = None):
         [[
             ["location_dest_id", "child_of", ubicaciones],
             ["location_id.usage", "in", ["internal", "transit"]],
-            ["state", "not in", ["done", "cancel"]]
+            ["state", "not in", ["done", "cancel"]],
+            ["scheduled_date", ">=", (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")]
         ]],
         {
             "fields": ["name", "location_id", "location_dest_id", "state", "origin", "move_ids", "scheduled_date"],
