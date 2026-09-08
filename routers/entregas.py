@@ -282,7 +282,23 @@ async def detalle_entrega(
         detalles = []
 
     data = _serializar_entrega(entrega)
-    data["productos"] = [_ser_prod(p) for p in productos]
+
+    # Cruzar con el catalogo para saber cuales productos PUEDEN ir en caja
+    # master — el operador decide despues si los usa asi o no al imprimir.
+    claves = list(set((p.clave or "").strip().upper() for p in productos if p.clave))
+    catalogo_map = {}
+    if claves:
+        cat_r = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(claves)))
+        for c in cat_r.scalars():
+            catalogo_map[c.sku] = c.cm_cant or 0
+
+    productos_ser = []
+    for p in productos:
+        s = _ser_prod(p)
+        s["cm_cant"] = catalogo_map.get((p.clave or "").strip().upper(), 0)
+        productos_ser.append(s)
+
+    data["productos"] = productos_ser
     data["tarimas"] = [_ser_tarima(t, [d for d in detalles if d.id_tarima == t.id_tarima]) for t in tarimas]
     return data
 
@@ -657,9 +673,11 @@ async def etiqueta_tarima(
 @router.get("/{id_entrega}/etiquetas-sueltas")
 async def etiquetas_sueltas(
     id_entrega: str,
+    master:     Optional[str] = None,  # claves separadas por coma que SI usan caja master
     db:         AsyncSession = Depends(get_db),
     user:       dict = Depends(get_current_user)
 ):
+    skus_master = set(s.strip().upper() for s in (master or "").split(",") if s.strip())
     result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
     entrega = result.scalar_one_or_none()
     if not entrega:
@@ -695,13 +713,15 @@ async def etiquetas_sueltas(
 
     # Cada producto se reparte en N bultos si viene en caja master —
     # una sola etiqueta con 800 piezas esta mal si son 3 por caja;
-    # deben ser ~267 etiquetas, una por caja fisica.
+    # deben ser ~267 etiquetas, una por caja fisica — PERO solo para los
+    # SKUs que el operador eligio usar en modo caja master (default: no).
     bultos = []
     for p in productos:
         clave_norm = (p.clave or "").strip().upper()
         cm_cant = catalogo_map.get(clave_norm, 0)
         cantidad_pend = p.cantidad_pendiente
-        if cm_cant and cm_cant > 0 and cantidad_pend > cm_cant:
+        usar_master = clave_norm in skus_master and cm_cant and cm_cant > 0
+        if usar_master and cantidad_pend > cm_cant:
             num_cajas = -(-cantidad_pend // cm_cant)  # division hacia arriba
             restante = cantidad_pend
             for j in range(num_cajas):
@@ -709,7 +729,7 @@ async def etiquetas_sueltas(
                 restante -= cant_este
                 bultos.append({"producto": p, "cantidad": cant_este, "caja_master": True, "num_caja": j + 1, "total_cajas": num_cajas})
         else:
-            bultos.append({"producto": p, "cantidad": cantidad_pend, "caja_master": bool(cm_cant), "num_caja": 1, "total_cajas": 1})
+            bultos.append({"producto": p, "cantidad": cantidad_pend, "caja_master": bool(usar_master), "num_caja": 1, "total_cajas": 1})
 
     total_bultos_suelto = len(bultos)
     total_piezas = sum(b["cantidad"] for b in bultos)
