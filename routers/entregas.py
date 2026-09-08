@@ -7,7 +7,7 @@ from datetime import datetime
 import io, re, time
 
 from database import get_db
-from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso, SolicitudReimpresion, SolicitudCambioSistema
+from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso, SolicitudReimpresion, SolicitudCambioSistema, CatalogoItem
 from services.auth import verificar_token
 
 router = APIRouter()
@@ -685,13 +685,40 @@ async def etiquetas_sueltas(
         )
         offset = tars_r.scalar() or 0
 
-    total_skus = len(productos)
-    total_piezas = sum(p.cantidad_pendiente for p in productos)
+    # Cruzar con el catalogo para saber cuantas piezas trae cada caja master
+    claves = list(set((p.clave or "").strip().upper() for p in productos if p.clave))
+    catalogo_map = {}
+    if claves:
+        cat_r = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(claves)))
+        for c in cat_r.scalars():
+            catalogo_map[c.sku] = c.cm_cant or 0
+
+    # Cada producto se reparte en N bultos si viene en caja master —
+    # una sola etiqueta con 800 piezas esta mal si son 3 por caja;
+    # deben ser ~267 etiquetas, una por caja fisica.
+    bultos = []
+    for p in productos:
+        clave_norm = (p.clave or "").strip().upper()
+        cm_cant = catalogo_map.get(clave_norm, 0)
+        cantidad_pend = p.cantidad_pendiente
+        if cm_cant and cm_cant > 0 and cantidad_pend > cm_cant:
+            num_cajas = -(-cantidad_pend // cm_cant)  # division hacia arriba
+            restante = cantidad_pend
+            for j in range(num_cajas):
+                cant_este = min(cm_cant, restante)
+                restante -= cant_este
+                bultos.append({"producto": p, "cantidad": cant_este, "caja_master": True, "num_caja": j + 1, "total_cajas": num_cajas})
+        else:
+            bultos.append({"producto": p, "cantidad": cantidad_pend, "caja_master": bool(cm_cant), "num_caja": 1, "total_cajas": 1})
+
+    total_bultos_suelto = len(bultos)
+    total_piezas = sum(b["cantidad"] for b in bultos)
 
     resultado = []
     acumulado = 0
-    for i, p in enumerate(productos, 1):
-        cant = p.cantidad_pendiente
+    for i, b in enumerate(bultos, 1):
+        p = b["producto"]
+        cant = b["cantidad"]
         pieza_inicio = acumulado + 1
         acumulado += cant
         resultado.append({
@@ -701,8 +728,11 @@ async def etiquetas_sueltas(
             "cantidad":            cant,
             "unidad":              p.unidad,
             "num_sku":             offset + i,
-            "total_skus_entrega":  offset + total_skus,
+            "total_skus_entrega":  offset + total_bultos_suelto,
             "es_mix":              entrega.sistema == "MIX",
+            "caja_master":         b["caja_master"],
+            "num_caja":            b["num_caja"],
+            "total_cajas_sku":     b["total_cajas"],
             "pieza_inicio":        pieza_inicio,
             "total_piezas_entrega":total_piezas,
             "num_entrega":         entrega.num_entrega,
