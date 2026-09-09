@@ -75,17 +75,21 @@ async def _uid(client: httpx.AsyncClient):
     _uid_cache["uid"] = uid
     return uid
 
-async def listar_ovs_pendientes():
+async def listar_ovs_pendientes(warehouse_ids: list = None):
     fecha_limite = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
+    dominio = [["picking_ids", "!=", False], ["state", "in", ["sale", "done"]], ["date_order", ">=", fecha_limite]]
+    if warehouse_ids:
+        dominio.append(["warehouse_id", "in", warehouse_ids])
     ovs = await _rpc("sale.order", "search_read",
-        [[["picking_ids", "!=", False], ["state", "in", ["sale", "done"]], ["date_order", ">=", fecha_limite]]],
-        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order"], "order": "id desc", "limit": 400}
+        [dominio],
+        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id"], "order": "id desc", "limit": 400}
     )
     return [{
         "num_ov": ov["name"],
         "cliente": ov["partner_id"][1] if ov.get("partner_id") else "",
         "comercializador": PARTNER_MAP.get(ov["partner_id"][0] if ov.get("partner_id") else None, ""),
         "fecha": (ov.get("date_order") or "")[:10],
+        "almacen": ov["warehouse_id"][1] if ov.get("warehouse_id") else "",
         "picking_ids": ov["picking_ids"]
     } for ov in ovs]
 
