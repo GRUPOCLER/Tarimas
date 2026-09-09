@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import os
 from database import get_db
-from models.models import Entrega, AlmacenTraspaso
+from models.models import Entrega, AlmacenTraspaso, UsuarioAlmacen
 from routers.entregas import get_current_user
 from services import odoo as odoo_svc
 
@@ -11,8 +11,14 @@ router = APIRouter()
 
 @router.get("/ovs")
 async def listar_ovs(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    warehouse_ids = None
+    if user.get("rol") != "admin":
+        result = await db.execute(select(UsuarioAlmacen.odoo_warehouse_id).where(UsuarioAlmacen.usuario == user["sub"]))
+        asignados = [row[0] for row in result.all()]
+        if asignados:  # solo restringe si el usuario tiene almacenes configurados
+            warehouse_ids = asignados
     try:
-        ovs = await odoo_svc.listar_ovs_pendientes()
+        ovs = await odoo_svc.listar_ovs_pendientes(warehouse_ids)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -182,3 +188,42 @@ async def diag_buscar_partner(nombre: str, user: dict = Depends(get_current_user
         return {"db_actual": odoo_svc.ODOO_DB, "resultados": resultados}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+# ── ALMACENES AUTORIZADOS POR USUARIO (solo Admin) ──────────────
+@router.get("/usuarios-almacenes/{usuario}")
+async def listar_almacenes_usuario(usuario: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    if user.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un Administrador puede configurar esto")
+    result = await db.execute(select(UsuarioAlmacen).where(UsuarioAlmacen.usuario == usuario))
+    return [{
+        "id": a.id, "odoo_warehouse_id": a.odoo_warehouse_id, "nombre": a.nombre, "codigo": a.codigo
+    } for a in result.scalars()]
+
+@router.post("/usuarios-almacenes/{usuario}")
+async def agregar_almacen_usuario(usuario: str, body: dict, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    if user.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un Administrador puede configurar esto")
+    existe = await db.execute(
+        select(UsuarioAlmacen).where(UsuarioAlmacen.usuario == usuario, UsuarioAlmacen.odoo_warehouse_id == body["odoo_warehouse_id"])
+    )
+    if existe.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Ese almacen ya esta asignado a este usuario")
+    nuevo = UsuarioAlmacen(
+        usuario=usuario, odoo_warehouse_id=body["odoo_warehouse_id"],
+        nombre=body.get("nombre", ""), codigo=body.get("codigo", ""), agregado_por=user["sub"]
+    )
+    db.add(nuevo)
+    await db.commit()
+    return {"ok": True}
+
+@router.delete("/usuarios-almacenes/{id_asignacion}")
+async def quitar_almacen_usuario(id_asignacion: int, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    if user.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un Administrador puede configurar esto")
+    result = await db.execute(select(UsuarioAlmacen).where(UsuarioAlmacen.id == id_asignacion))
+    a = result.scalar_one_or_none()
+    if not a:
+        raise HTTPException(status_code=404, detail="No encontrado")
+    await db.delete(a)
+    await db.commit()
+    return {"ok": True}
