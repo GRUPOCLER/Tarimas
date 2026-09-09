@@ -291,12 +291,14 @@ async def detalle_entrega(
     if claves:
         cat_r = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(claves)))
         for c in cat_r.scalars():
-            catalogo_map[c.sku] = c.cm_cant or 0
+            catalogo_map[c.sku] = {"cm_cant": c.cm_cant or 0, "peso_unit": c.peso_unit or 0}
 
     productos_ser = []
     for p in productos:
         s = _ser_prod(p)
-        s["cm_cant"] = catalogo_map.get((p.clave or "").strip().upper(), 0)
+        info_cat = catalogo_map.get((p.clave or "").strip().upper(), {})
+        s["cm_cant"] = info_cat.get("cm_cant", 0)
+        s["peso_unit"] = info_cat.get("peso_unit", 0)
         productos_ser.append(s)
 
     data["productos"] = productos_ser
@@ -632,6 +634,15 @@ async def etiqueta_tarima(
         "unidad":         d.unidad,
     } for d in detalles_r.scalars()]
 
+    # Peso calculado del contenido, a partir del catalogo (peso por pieza x cantidad)
+    claves_tarima = list(set((p["clave"] or "").strip().upper() for p in productos if p["clave"]))
+    pesos_map = {}
+    if claves_tarima:
+        cat_r2 = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(claves_tarima)))
+        for c in cat_r2.scalars():
+            pesos_map[c.sku] = c.peso_unit or 0
+    peso_contenido_kg = round(sum(pesos_map.get((p["clave"] or "").strip().upper(), 0) * p["cantidad_total"] for p in productos), 3)
+
     folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_tarima).upper())
     numero_tarima = _numero_tarima(id_tarima)
     barcode_entrega = folio_limpio
@@ -661,8 +672,8 @@ async def etiqueta_tarima(
         "productos":       productos,
         "total_piezas":    total_piezas,
         "peso_palet_kg":   peso_palet,
-        "peso_neto_kg":    0,
-        "peso_bruto_kg":   peso_palet,
+        "peso_neto_kg":    peso_contenido_kg,
+        "peso_bruto_kg":   round(peso_palet + peso_contenido_kg, 3),
         "largo_cm":        tarima.largo_cm or 0,
         "ancho_cm":        tarima.ancho_cm or 0,
         "alto_cm":         tarima.alto_cm or 0,
@@ -706,13 +717,13 @@ async def etiquetas_sueltas(
         )
         offset = tars_r.scalar() or 0
 
-    # Cruzar con el catalogo para saber cuantas piezas trae cada caja master
+    # Cruzar con el catalogo para saber cuantas piezas trae cada caja master y sus pesos
     claves = list(set((p.clave or "").strip().upper() for p in productos if p.clave))
     catalogo_map = {}
     if claves:
         cat_r = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(claves)))
         for c in cat_r.scalars():
-            catalogo_map[c.sku] = c.cm_cant or 0
+            catalogo_map[c.sku] = {"cm_cant": c.cm_cant or 0, "peso_unit": c.peso_unit or 0, "cm_peso": c.cm_peso or 0}
 
     # Cada producto se reparte en N bultos si viene en caja master —
     # una sola etiqueta con 800 piezas esta mal si son 3 por caja;
@@ -721,7 +732,10 @@ async def etiquetas_sueltas(
     bultos = []
     for p in productos:
         clave_norm = (p.clave or "").strip().upper()
-        cm_cant = catalogo_map.get(clave_norm, 0)
+        info_cat = catalogo_map.get(clave_norm, {})
+        cm_cant = info_cat.get("cm_cant", 0)
+        peso_unit = info_cat.get("peso_unit", 0)
+        cm_peso = info_cat.get("cm_peso", 0)
         cantidad_pend = p.cantidad_pendiente
         usar_master = clave_norm in skus_master and cm_cant and cm_cant > 0
         if usar_master:
@@ -730,12 +744,15 @@ async def etiquetas_sueltas(
             for j in range(num_cajas):
                 cant_este = min(cm_cant, restante) if restante > 0 else 0
                 restante -= cant_este
-                bultos.append({"producto": p, "cantidad": cant_este, "caja_master": True, "num_caja": j + 1, "total_cajas": num_cajas})
+                # Peso de la caja: usa el peso de caja master del catalogo si existe,
+                # si no, lo calcula multiplicando el peso unitario por lo que trae esta caja
+                peso_bulto = cm_peso if cm_peso > 0 else round(peso_unit * cant_este, 3)
+                bultos.append({"producto": p, "cantidad": cant_este, "caja_master": True, "num_caja": j + 1, "total_cajas": num_cajas, "peso_kg": peso_bulto})
         else:
             # Modo pieza: una etiqueta POR CADA UNIDAD, no una sola con el total
             # (11 piezas pendientes = 11 etiquetas individuales, no "11 PZA" en una)
             for i in range(cantidad_pend):
-                bultos.append({"producto": p, "cantidad": 1, "caja_master": False, "num_caja": i + 1, "total_cajas": cantidad_pend})
+                bultos.append({"producto": p, "cantidad": 1, "caja_master": False, "num_caja": i + 1, "total_cajas": cantidad_pend, "peso_kg": round(peso_unit, 3)})
 
     total_bultos_suelto = len(bultos)
     total_piezas = sum(b["cantidad"] for b in bultos)
@@ -759,6 +776,7 @@ async def etiquetas_sueltas(
             "caja_master":         b["caja_master"],
             "num_caja":            b["num_caja"],
             "total_cajas_sku":     b["total_cajas"],
+            "peso_kg":             b.get("peso_kg", 0),
             "pieza_inicio":        pieza_inicio,
             "total_piezas_entrega":total_piezas,
             "num_entrega":         entrega.num_entrega,
@@ -836,10 +854,26 @@ async def lista_empaque(
                    len(sueltos_prods) if entrega.sistema == "CS" else \
                    total_tarimas_cerradas + len(sueltos_prods)
 
+    # Cruzar con catalogo para peso por producto — tanto lo que va en
+    # tarima/caja como lo suelto
+    claves_todas = set()
+    for d in detalles:
+        if d.clave: claves_todas.add(d.clave.strip().upper())
+    for p in sueltos_prods:
+        if p.clave: claves_todas.add(p.clave.strip().upper())
+    pesos_map = {}
+    if claves_todas:
+        cat_r3 = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(list(claves_todas))))
+        for c in cat_r3.scalars():
+            pesos_map[c.sku] = c.peso_unit or 0
+
     tarimas_data = []
+    peso_mercancia_total = 0.0
     for t in tarimas_ordenadas:
         det = [d for d in detalles if d.id_tarima == t.id_tarima]
         piezas = sum(d.cantidad_asignada for d in det)
+        peso_contenido = round(sum(pesos_map.get((d.clave or "").strip().upper(), 0) * d.cantidad_asignada for d in det), 3)
+        peso_mercancia_total += peso_contenido
         tarimas_data.append({
             "id_tarima":     t.id_tarima,
             "numero_tarima": _numero_tarima(t.id_tarima),
@@ -848,11 +882,16 @@ async def lista_empaque(
             "tipo_bulto":    t.tipo_bulto or "tarima",
             "estatus":       t.estatus,
             "peso_palet_kg": t.peso_palet_kg or 0,
+            "peso_neto_kg":  peso_contenido,
+            "peso_bruto_kg": round((t.peso_palet_kg or 0) + peso_contenido, 3),
             "largo_cm":      t.largo_cm or 0,
             "ancho_cm":      t.ancho_cm or 0,
             "alto_cm":       t.alto_cm or 0,
             "total_piezas":  piezas,
-            "productos":     [_ser_detalle(d) for d in det],
+            "productos":     [
+                {**_ser_detalle(d), "peso_kg": round(pesos_map.get((d.clave or "").strip().upper(), 0) * d.cantidad_asignada, 3)}
+                for d in det
+            ],
         })
 
     sueltos_data = []
@@ -860,6 +899,10 @@ async def lista_empaque(
         s = _ser_prod(p)
         s["numero_bulto"] = offset_sueltos + i
         s["total_bultos"] = total_bultos
+        cant_p = s.get("cantidad_pendiente") if entrega.sistema != "CS" else s.get("cantidad_total")
+        peso_p = round(pesos_map.get((p.clave or "").strip().upper(), 0) * (cant_p or 0), 3)
+        s["peso_kg"] = peso_p
+        peso_mercancia_total += peso_p
         sueltos_data.append(s)
 
     if not tarimas_data and not sueltos_data:
@@ -883,6 +926,8 @@ async def lista_empaque(
         "total_piezas":         sum(t["total_piezas"] for t in tarimas_data) + total_piezas_sueltos,
         "total_piezas_sueltos": total_piezas_sueltos,
         "peso_palet_total_kg":  round(sum(t["peso_palet_kg"] for t in tarimas_data), 2),
+        "peso_mercancia_kg":    round(peso_mercancia_total, 2),
+        "peso_total_kg":        round(sum(t["peso_palet_kg"] for t in tarimas_data) + peso_mercancia_total, 2),
         "barcode_entrega":      folio_limpio,
         "barcode_entrega_url":  _barcode_url(folio_limpio),
     }
