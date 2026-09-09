@@ -71,6 +71,7 @@ class EntregaIn(BaseModel):
 
 class CrearTarimaIn(BaseModel):
     peso_palet_kg: Optional[float] = 0
+    tipo_bulto: Optional[str] = "tarima"  # "tarima" | "caja"
     ids_entregas_fusionadas: Optional[List[str]] = None  # 2+ ids del mismo cliente
 
 class FusionDetalleIn(BaseModel):
@@ -463,9 +464,10 @@ async def crear_tarima(
     idx = (conteo.scalar() or 0) + 1
     id_t = _gen_id_tarima(id_entrega, idx)
 
+    tipo = body.tipo_bulto if body.tipo_bulto in ("tarima", "caja") else "tarima"
     db.add(Tarima(
         id_tarima=id_t, id_entrega=id_entrega, estatus="abierta",
-        peso_palet_kg=body.peso_palet_kg or 0, ids_entregas_fusionadas=fusion_str
+        peso_palet_kg=body.peso_palet_kg or 0, tipo_bulto=tipo, ids_entregas_fusionadas=fusion_str
     ))
     await db.commit()
     return {"ok": True, "id_tarima": id_t, "numero_tarima": idx}
@@ -642,6 +644,7 @@ async def etiqueta_tarima(
         "id_tarima":       tarima.id_tarima,
         "numero_tarima":   numero_tarima,
         "total_tarimas":   total_tarimas,
+        "tipo_bulto":      tarima.tipo_bulto or "tarima",
         "es_mix":          es_mix,
         "total_bultos":    total_bultos,
         "id_entrega":      entrega.id_entrega,
@@ -721,15 +724,18 @@ async def etiquetas_sueltas(
         cm_cant = catalogo_map.get(clave_norm, 0)
         cantidad_pend = p.cantidad_pendiente
         usar_master = clave_norm in skus_master and cm_cant and cm_cant > 0
-        if usar_master and cantidad_pend > cm_cant:
-            num_cajas = -(-cantidad_pend // cm_cant)  # division hacia arriba
+        if usar_master:
+            num_cajas = max(-(-cantidad_pend // cm_cant), 1)  # division hacia arriba, minimo 1
             restante = cantidad_pend
             for j in range(num_cajas):
-                cant_este = min(cm_cant, restante)
+                cant_este = min(cm_cant, restante) if restante > 0 else 0
                 restante -= cant_este
                 bultos.append({"producto": p, "cantidad": cant_este, "caja_master": True, "num_caja": j + 1, "total_cajas": num_cajas})
         else:
-            bultos.append({"producto": p, "cantidad": cantidad_pend, "caja_master": bool(usar_master), "num_caja": 1, "total_cajas": 1})
+            # Modo pieza: una etiqueta POR CADA UNIDAD, no una sola con el total
+            # (11 piezas pendientes = 11 etiquetas individuales, no "11 PZA" en una)
+            for i in range(cantidad_pend):
+                bultos.append({"producto": p, "cantidad": 1, "caja_master": False, "num_caja": i + 1, "total_cajas": cantidad_pend})
 
     total_bultos_suelto = len(bultos)
     total_piezas = sum(b["cantidad"] for b in bultos)
@@ -839,6 +845,7 @@ async def lista_empaque(
             "numero_tarima": _numero_tarima(t.id_tarima),
             "numero_bulto":  _numero_tarima(t.id_tarima),
             "total_bultos":  total_bultos,
+            "tipo_bulto":    t.tipo_bulto or "tarima",
             "estatus":       t.estatus,
             "peso_palet_kg": t.peso_palet_kg or 0,
             "largo_cm":      t.largo_cm or 0,
@@ -1245,6 +1252,7 @@ def _ser_tarima(t: Tarima, detalles: list = None) -> dict:
         "largo_cm":       t.largo_cm or 0,
         "ancho_cm":       t.ancho_cm or 0,
         "alto_cm":        t.alto_cm or 0,
+        "tipo_bulto":     t.tipo_bulto or "tarima",
         "impresa_veces":  t.impresa_veces or 0,
         "productos":      [_ser_detalle(d) for d in (detalles or [])],
     }
