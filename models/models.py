@@ -85,6 +85,7 @@ class Tarima(Base):
     largo_cm       = Column(Float, default=0)
     ancho_cm       = Column(Float, default=0)
     alto_cm        = Column(Float, default=0)
+    tipo_bulto     = Column(String(10), default="tarima")  # "tarima" | "caja"
     ids_entregas_fusionadas = Column(Text, nullable=True)  # "ID1,ID2,ID3" — mismo cliente
     impresa_veces        = Column(Integer, default=0)
     primera_impresion_en = Column(DateTime, nullable=True)
