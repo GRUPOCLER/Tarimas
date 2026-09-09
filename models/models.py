@@ -180,3 +180,14 @@ class AlmacenTraspaso(Base):
     activo             = Column(Boolean, default=True)
     agregado_por       = Column(String(50))
     fecha_agregado     = Column(DateTime, server_default=func.now())
+
+# ── ALMACENES AUTORIZADOS POR USUARIO (visibilidad de OVs/Traspasos) ─
+class UsuarioAlmacen(Base):
+    __tablename__ = "usuarios_almacenes"
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    usuario            = Column(String(50), index=True)
+    odoo_warehouse_id  = Column(Integer, nullable=False)
+    nombre             = Column(String(120))
+    codigo             = Column(String(30))
+    agregado_por       = Column(String(50))
+    fecha_agregado     = Column(DateTime, server_default=func.now())
