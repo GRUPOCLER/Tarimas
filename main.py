@@ -39,6 +39,9 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS alto_cm FLOAT DEFAULT 0"
         ))
         await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS tipo_bulto VARCHAR(10) DEFAULT 'tarima'"
+        ))
+        await conn.execute(text(
             "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ids_entregas_fusionadas TEXT"
         ))
         await conn.execute(text(
