@@ -79,7 +79,7 @@ async def listar_ovs_pendientes():
     fecha_limite = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
     ovs = await _rpc("sale.order", "search_read",
         [[["picking_ids", "!=", False], ["state", "in", ["sale", "done"]], ["date_order", ">=", fecha_limite]]],
-        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order"], "order": "id desc", "limit": 60}
+        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order"], "order": "id desc", "limit": 400}
     )
     return [{
         "num_ov": ov["name"],
@@ -167,7 +167,7 @@ async def listar_traspasos_pendientes(ubicaciones: list = None):
         ]],
         {
             "fields": ["name", "location_id", "location_dest_id", "state", "origin", "move_ids", "scheduled_date"],
-            "order": "id desc", "limit": 60
+            "order": "id desc", "limit": 400
         }
     )
     return [{
