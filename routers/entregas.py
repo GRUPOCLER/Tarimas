@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -129,6 +130,13 @@ def _gen_id_detalle(id_tarima: str) -> str:
 def _numero_tarima(id_tarima: str) -> int:
     m = re.search(r"-T(\d+)$", id_tarima)
     return int(m.group(1)) if m else 1
+
+def _mapa_numeros_secuenciales(tarimas: list) -> dict:
+    """Numera las tarimas/cajas 1, 2, 3... segun su orden real de creacion
+    entre las que siguen existiendo — si se borro una en medio, no deja
+    hueco (nunca muestra 1, 3, 4 por una eliminada)."""
+    ordenadas = sorted(tarimas, key=lambda t: t.fecha_creacion or datetime.min)
+    return {t.id_tarima: i + 1 for i, t in enumerate(ordenadas)}
 
 # ── LISTAR ENTREGAS ───────────────────────────────────────────
 @router.get("/")
@@ -302,7 +310,8 @@ async def detalle_entrega(
         productos_ser.append(s)
 
     data["productos"] = productos_ser
-    data["tarimas"] = [_ser_tarima(t, [d for d in detalles if d.id_tarima == t.id_tarima]) for t in tarimas]
+    mapa_num = _mapa_numeros_secuenciales(tarimas)
+    data["tarimas"] = [_ser_tarima(t, [d for d in detalles if d.id_tarima == t.id_tarima], mapa_num[t.id_tarima]) for t in tarimas]
     return data
 
 # ── CREAR ENTREGA ─────────────────────────────────────────────
@@ -468,17 +477,33 @@ async def crear_tarima(
             raise HTTPException(status_code=400, detail="Solo puedes fusionar entregas del mismo cliente")
         fusion_str = ",".join(body.ids_entregas_fusionadas)
 
-    conteo = await db.execute(select(func.count(Tarima.id_tarima)).where(Tarima.id_entrega == id_entrega))
-    idx = (conteo.scalar() or 0) + 1
-    id_t = _gen_id_tarima(id_entrega, idx)
+    # Buscamos el numero mas alto ya usado (no solo contamos cuantas hay),
+    # para que si alguna tarima se elimino en medio, nunca se repita un ID.
+    existentes = await db.execute(select(Tarima.id_tarima).where(Tarima.id_entrega == id_entrega))
+    numeros = []
+    for (idt,) in existentes.all():
+        m = re.search(r"-T(\d+)$", idt)
+        if m:
+            numeros.append(int(m.group(1)))
+    idx = (max(numeros) + 1) if numeros else 1
 
     tipo = body.tipo_bulto if body.tipo_bulto in ("tarima", "caja") else "tarima"
-    db.add(Tarima(
-        id_tarima=id_t, id_entrega=id_entrega, estatus="abierta",
-        peso_palet_kg=body.peso_palet_kg or 0, tipo_bulto=tipo, ids_entregas_fusionadas=fusion_str
-    ))
-    await db.commit()
-    return {"ok": True, "id_tarima": id_t, "numero_tarima": idx}
+
+    # Reintenta con el siguiente numero si por alguna razon (dos clics muy
+    # rapidos, por ejemplo) el ID ya existe — nunca falla por esto.
+    for intento in range(5):
+        id_t = _gen_id_tarima(id_entrega, idx)
+        db.add(Tarima(
+            id_tarima=id_t, id_entrega=id_entrega, estatus="abierta",
+            peso_palet_kg=body.peso_palet_kg or 0, tipo_bulto=tipo, ids_entregas_fusionadas=fusion_str
+        ))
+        try:
+            await db.commit()
+            return {"ok": True, "id_tarima": id_t, "numero_tarima": idx}
+        except IntegrityError:
+            await db.rollback()
+            idx += 1
+    raise HTTPException(status_code=500, detail="No se pudo generar un ID de tarima despues de varios intentos")
 
 # ── ASIGNAR CANTIDADES DE PRODUCTOS A UNA TARIMA ──────────────
 @router.post("/{id_entrega}/tarimas/{id_tarima}/asignar")
@@ -619,7 +644,8 @@ async def etiqueta_tarima(
         raise HTTPException(status_code=404, detail="Tarima no encontrada")
 
     todas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega, Tarima.estatus == "cerrada"))
-    total_tarimas = len(todas.scalars().all())
+    tarimas_cerradas = todas.scalars().all()
+    total_tarimas = len(tarimas_cerradas)
 
     # Para MIX: el conteo de bultos combina tarimas + carga suelta pendiente,
     # ya que ambos son "bultos" fisicos que suben al mismo embarque
@@ -650,7 +676,7 @@ async def etiqueta_tarima(
     peso_contenido_kg = round(sum(pesos_map.get((p["clave"] or "").strip().upper(), 0) * p["cantidad_total"] for p in productos), 3)
 
     folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_tarima).upper())
-    numero_tarima = _numero_tarima(id_tarima)
+    numero_tarima = _mapa_numeros_secuenciales(tarimas_cerradas).get(id_tarima, 1)
     barcode_entrega = folio_limpio
     barcode_tarima  = f"{folio_limpio}-T{numero_tarima}"
 
@@ -875,6 +901,7 @@ async def lista_empaque(
 
     tarimas_data = []
     peso_mercancia_total = 0.0
+    mapa_num_packing = _mapa_numeros_secuenciales(tarimas_ordenadas)
     for t in tarimas_ordenadas:
         det = [d for d in detalles if d.id_tarima == t.id_tarima]
         piezas = sum(d.cantidad_asignada for d in det)
@@ -882,8 +909,8 @@ async def lista_empaque(
         peso_mercancia_total += peso_contenido
         tarimas_data.append({
             "id_tarima":     t.id_tarima,
-            "numero_tarima": _numero_tarima(t.id_tarima),
-            "numero_bulto":  _numero_tarima(t.id_tarima),
+            "numero_tarima": mapa_num_packing[t.id_tarima],
+            "numero_bulto":  mapa_num_packing[t.id_tarima],
             "total_bultos":  total_bultos,
             "tipo_bulto":    t.tipo_bulto or "tarima",
             "estatus":       t.estatus,
@@ -1289,11 +1316,11 @@ def _ser_detalle(d: DetalleTarima) -> dict:
         "unidad":            d.unidad,
     }
 
-def _ser_tarima(t: Tarima, detalles: list = None) -> dict:
+def _ser_tarima(t: Tarima, detalles: list = None, numero_secuencial: int = None) -> dict:
     return {
         "id_tarima":      t.id_tarima,
         "id_entrega":     t.id_entrega,
-        "numero_tarima":  _numero_tarima(t.id_tarima),
+        "numero_tarima":  numero_secuencial if numero_secuencial is not None else _numero_tarima(t.id_tarima),
         "estatus":        t.estatus,
         "fecha_creacion": str(t.fecha_creacion or ""),
         "fecha_cierre":   str(t.fecha_cierre or ""),
