@@ -1,14 +1,12 @@
-import re, time
+import re
 
-SUCURSALES = [
-    'ACAYUCAN','APIZACO','ATLIXCO','BOCA','BOTICARIA','BOULEVARD',
-    'CANCUN','CARDEL','CARDENAS','COATZA','COSAMALOAPAN','DIAZ MIRON',
+SUCURSALES = ['ACAYUCAN','APIZACO','ATLIXCO','BOCA','BOTICARIA','BOULEVARD',
+    'CANCUN','CARDEL','CARDENAS','CUAUTLA','COATZA','COSAMALOAPAN','DIAZ MIRON',
     'EMILIANO ZAPATA','GUADALAJARA','IZUCAR','LAS CHOAPAS','LOMA BONITA',
     'MALIBRAN','MARTINEZ','MERIDA','OAXACA','ORIZABA','PACHUCA','PAPANTLA',
     'PEROTE','PUEBLA','SALINA CRUZ','SAN ANDRES','TECAMACHALCO','TEHUACAN',
     'TEJERIA','TENOSIQUE','TEXMELUCAN','TIERRA BLANCA','TIZAYUCA',
-    'TLALNEPANTLA','TUXPAN','TUXTEPEC','VER NORTE','VILLAHERMOSA','XALAPA'
-]
+    'TLALNEPANTLA','TUXPAN','TUXTEPEC','VER NORTE','VILLAHERMOSA','XALAPA','CORDOBA BODEGA']
 
 def parsear_sap_raiker(texto: str, nombre_archivo: str = '') -> dict:
     lineas = [l.replace('\u25a0','').strip() for l in texto.split('\n') if l.strip()]
@@ -25,9 +23,9 @@ def parsear_sap_raiker(texto: str, nombre_archivo: str = '') -> dict:
         for l in lineas:
             mn = re.match(r'^([\d,]{3,8})$', l)
             if mn: folio = f"TL-{mn.group(1).replace(',','')}"; break
-    if not folio: folio = f"TL-{int(time.time())}"
+    if not folio: folio = f"TL-{__import__('time').time_ns()}"
 
-    sucursal   = ''
+    sucursal = ''
     archivo_up = (nombre_archivo or '').upper().replace('_',' ').replace('-',' ')
     for s in SUCURSALES:
         if s in archivo_up: sucursal = s; break
@@ -36,12 +34,13 @@ def parsear_sap_raiker(texto: str, nombre_archivo: str = '') -> dict:
         for s in SUCURSALES:
             if s in texto_up: sucursal = s; break
 
+    # Productos formato columnar
     SKU_RE = re.compile(r'^[A-Z][A-Z0-9\-\.\/]{2,19}$')
     NUM_RE = re.compile(r'^\d+$')
 
     inicio = 0
     for i, l in enumerate(lineas):
-        if re.search(r'[Nn]umero de articulo', l):
+        if re.search(r'[Nn]umero de articulo|[Nn]mero de art', l):
             inicio = i + 1; break
 
     productos = []
@@ -52,23 +51,18 @@ def parsear_sap_raiker(texto: str, nombre_archivo: str = '') -> dict:
             i += 1
             if i >= len(lineas): break
             if not SKU_RE.match(lineas[i]): continue
-            sku  = lineas[i]
-            desc = []
-            i   += 1
+            sku = lineas[i]; desc = []; i += 1
             while i < len(lineas):
                 l2 = lineas[i]
                 if l2 in ('PZA','PZ','EA','UN'): i += 1; break
                 if re.search(r'^Total:|^Pagina|SAP Business', l2): break
-                desc.append(l2)
-                i += 1
+                desc.append(l2); i += 1
             cant = 1
             if i < len(lineas) and NUM_RE.match(lineas[i]):
                 cant = int(lineas[i]); i += 1
             productos.append({
-                'clave':          sku,
-                'descripcion':    ' '.join(desc).strip(),
-                'cantidad_total': cant,
-                'unidad':         'PZA'
+                'clave': sku, 'descripcion': ' '.join(desc).strip(),
+                'cantidad_total': cant, 'unidad': 'PZA'
             })
         else:
             i += 1
