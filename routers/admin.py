@@ -130,6 +130,7 @@ async def ver_logs(
     return [{
         "id":      l.id,
         "fecha":   str(l.fecha or ""),
+        "fecha_local": str(l.fecha_local or ""),
         "usuario": l.usuario,
         "accion":  l.accion,
         "detalle": l.detalle,
