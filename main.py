@@ -42,6 +42,18 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS tipo_bulto VARCHAR(10) DEFAULT 'tarima'"
         ))
         await conn.execute(text(
+            "ALTER TABLE log_accesos ADD COLUMN IF NOT EXISTS fecha_local TIMESTAMP "
+            "DEFAULT (now() AT TIME ZONE 'America/Mexico_City')"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE solicitudes_reimpresion ADD COLUMN IF NOT EXISTS fecha_solicitud_local TIMESTAMP "
+            "DEFAULT (now() AT TIME ZONE 'America/Mexico_City')"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE solicitudes_cambio_sistema ADD COLUMN IF NOT EXISTS fecha_solicitud_local TIMESTAMP "
+            "DEFAULT (now() AT TIME ZONE 'America/Mexico_City')"
+        ))
+        await conn.execute(text(
             "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ids_entregas_fusionadas TEXT"
         ))
         await conn.execute(text(
