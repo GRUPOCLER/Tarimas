@@ -1,5 +1,6 @@
 import os, re, httpx
 from datetime import datetime, timedelta
+from parsers.sap_raiker import SUCURSALES as SUCURSALES_RAIKER
 
 ODOO_URL      = os.getenv("ODOO_URL", "")
 ODOO_DB       = os.getenv("ODOO_DB", "")
@@ -93,6 +94,26 @@ async def listar_ovs_pendientes(warehouse_ids: list = None):
         "picking_ids": ov["picking_ids"]
     } for ov in ovs]
 
+def _detectar_sucursal_raiker(nombre_contacto: str) -> str:
+    """Detecta la sucursal Raiker (Boca, Boticaria, Tejeria, etc.) a partir
+    del nombre del contacto de envio en Odoo. El contacto normalmente viene
+    formateado como 'AGROINDUSTRIAS RAIKER, BOCA' — el nombre de la
+    sucursal despues de la coma."""
+    if not nombre_contacto:
+        return ""
+    texto = nombre_contacto.upper()
+    if "," in texto:
+        candidato = texto.split(",")[-1].strip()
+        for s in SUCURSALES_RAIKER:
+            if candidato == s or candidato.startswith(s):
+                return s
+    # Respaldo: busca cualquier sucursal conocida mencionada en el nombre completo
+    for s in SUCURSALES_RAIKER:
+        if s in texto:
+            return s
+    return ""
+
+
 async def cargar_entrega(picking_ids: list):
     picks = await _rpc("stock.picking", "search_read",
         [[["id", "in", picking_ids]]],
@@ -121,6 +142,7 @@ async def cargar_entrega(picking_ids: list):
     # Direccion de entrega real: viene del campo "partner_shipping_id" de la
     # orden de venta (Odoo estandar), no del cliente general de la OV.
     direccion = p["partner_id"][1] if p.get("partner_id") else ""
+    sucursal_detectada = ""
     if p.get("sale_id"):
         try:
             ov = await _rpc("sale.order", "search_read",
@@ -131,7 +153,7 @@ async def cargar_entrega(picking_ids: list):
                 id_envio = ov[0]["partner_shipping_id"][0]
                 contactos = await _rpc("res.partner", "search_read",
                     [[["id", "=", id_envio]]],
-                    {"fields": ["street", "street2", "city", "state_id", "zip", "country_id"]}
+                    {"fields": ["name", "street", "street2", "city", "state_id", "zip", "country_id"]}
                 )
                 if contactos:
                     c = contactos[0]
@@ -144,6 +166,7 @@ async def cargar_entrega(picking_ids: list):
                     direccion_armada = ", ".join(x for x in partes if x)
                     if direccion_armada:
                         direccion = direccion_armada
+                    sucursal_detectada = _detectar_sucursal_raiker(c.get("name", ""))
         except Exception:
             pass  # si algo falla, se queda con el nombre del cliente como respaldo
 
@@ -152,6 +175,7 @@ async def cargar_entrega(picking_ids: list):
         "orden": p["sale_id"][1] if p.get("sale_id") else "",
         "nombre_cliente": p["partner_id"][1] if p.get("partner_id") else "",
         "direccion": direccion,
+        "sucursal": sucursal_detectada,
         "comercializador": PARTNER_MAP.get(p["partner_id"][0] if p.get("partner_id") else None, ""),
         "fuente": "odoo",
         "productos": productos
