@@ -7,6 +7,10 @@ def detectar_tipo(texto: str) -> str:
     if 'RETAILONE' in t_completo.replace(' ', '') and \
        ('SALIDA POR TRASPASO' in t_completo or 'ENTRADA POR TRASPASO' in t_completo):
         return 'TRASPASO_RAIKER'
+    # Nota de entrega TDK International — formato propio con sus propios
+    # marcadores, distinto de la nota de entrega generica ECOR
+    if 'TDK INTERNATIONAL' in t_completo and 'NOTA DE' in t_completo and 'ENTREGA' in t_completo:
+        return 'TDK_ENTREGA'
     # Traspasos SAP Business One (formato "transaccion entre almacenes")
     # — chequeo en texto completo, distinto del SAP_RAIKER (Solicitud de traslado)
     if 'TRANSACCIÓN ENTRE ALMACENES' in t_completo or 'TRANSACCION ENTRE ALMACENES' in t_completo:
