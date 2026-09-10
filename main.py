@@ -96,7 +96,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En produccion: URL del frontend
+    allow_origins=[
+        "https://cler-frontend-production.up.railway.app",
+        "http://localhost:5173",  # desarrollo local
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
