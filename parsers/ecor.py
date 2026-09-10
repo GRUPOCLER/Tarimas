@@ -1,16 +1,14 @@
-import re, time
+import re
 
 def _limpiar(texto: str) -> str:
-    reemplazos = {
-        'a':'a','e':'e','i':'i','o':'o','u':'u','n':'n',
-        'A':'A','E':'E','I':'I','O':'O','U':'U','N':'N'
-    }
+    reemplazos = {'á':'a','é':'e','í':'i','ó':'o','ú':'u','ñ':'n',
+                  'Á':'A','É':'E','Í':'I','Ó':'O','Ú':'U','Ñ':'N'}
     for src, dst in reemplazos.items():
         texto = texto.replace(src, dst)
     return re.sub(r'[^\x00-\x7F\n\r\t ]', ' ', texto)
 
 def parsear_ecor(texto: str) -> dict:
-    texto  = _limpiar(texto)
+    texto = _limpiar(texto)
     lineas = texto.split('\n')
 
     folio = ''
@@ -27,10 +25,11 @@ def parsear_ecor(texto: str) -> dict:
         p = m3.group(1).split('/')
         fecha = f"{p[2]}-{p[1]}-{p[0]}"
 
+    # Cliente desde "Direccion de envio:"
     cliente = ''
     dir_txt = ''
     for i, l in enumerate(lineas):
-        if re.search(r'direcci[oo]n de env[ii]o', l, re.I):
+        if re.search(r'direcci[oó]n de env[íi]o', l, re.I):
             for j in range(i+1, min(i+5, len(lineas))):
                 if lineas[j].strip() and not re.search(r'[aA]venida|[cC]alle|\d{5}', lineas[j]):
                     cliente = lineas[j].strip()
@@ -39,8 +38,9 @@ def parsear_ecor(texto: str) -> dict:
             dir_txt = ', '.join(dir_parts[:4])
             break
 
+    # Productos — enfoque por bloques [SKU]
     EXCLUIR = {'Pagina', 'pagina', 'Producto', 'serie', 'lote', 'Entregado'}
-    bloques  = list(re.finditer(r'\[([^\]]+)\]', texto))
+    bloques = list(re.finditer(r'\[([^\]]+)\]', texto))
     acumulado = {}
 
     for bi, match in enumerate(bloques):
@@ -72,7 +72,7 @@ def parsear_ecor(texto: str) -> dict:
             }
 
     return {
-        'num_entrega':    folio or f'EC-{int(time.time())}',
+        'num_entrega':    folio or f'EC-{__import__("time").time_ns()}',
         'nombre_cliente': cliente,
         'rfc_cliente':    '',
         'direccion':      dir_txt,
