@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean, Text, ForeignKey, Enum
+from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean, Text, ForeignKey, Enum, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum, uuid
@@ -132,7 +132,8 @@ class CatalogoItem(Base):
 class LogAcceso(Base):
     __tablename__ = "log_accesos"
     id      = Column(Integer, primary_key=True, autoincrement=True)
-    fecha   = Column(DateTime, server_default=func.now())
+    fecha   = Column(DateTime, server_default=func.now())  # UTC — fuente de verdad
+    fecha_local = Column(DateTime, server_default=text("(now() AT TIME ZONE 'America/Mexico_City')"))  # hora Veracruz, solo para auditoria directa en BD
     usuario = Column(String(50))
     accion  = Column(String(50))
     detalle = Column(Text)
@@ -148,7 +149,8 @@ class SolicitudReimpresion(Base):
     num_entrega            = Column(String(60))   # folio, para mostrar sin joins
     motivo                 = Column(Text)
     solicitado_por         = Column(String(50))
-    fecha_solicitud        = Column(DateTime, server_default=func.now())
+    fecha_solicitud        = Column(DateTime, server_default=func.now())  # UTC — fuente de verdad
+    fecha_solicitud_local  = Column(DateTime, server_default=text("(now() AT TIME ZONE 'America/Mexico_City')"))
     estatus                = Column(String(20), default="pendiente")  # pendiente | aprobada | rechazada | usada
     autorizado_por         = Column(String(50), nullable=True)
     fecha_resolucion       = Column(DateTime, nullable=True)
@@ -164,7 +166,8 @@ class SolicitudCambioSistema(Base):
     sistema_nuevo          = Column(String(10))
     motivo                 = Column(Text)
     solicitado_por         = Column(String(50))
-    fecha_solicitud        = Column(DateTime, server_default=func.now())
+    fecha_solicitud        = Column(DateTime, server_default=func.now())  # UTC — fuente de verdad
+    fecha_solicitud_local  = Column(DateTime, server_default=text("(now() AT TIME ZONE 'America/Mexico_City')"))
     estatus                = Column(String(20), default="pendiente")  # pendiente | aprobada | rechazada
     autorizado_por         = Column(String(50), nullable=True)
     fecha_resolucion       = Column(DateTime, nullable=True)
