@@ -1,87 +1,84 @@
-import re, time
+import re
 
-# ============================================================
-#  PARSER — FACTURA CFDI ECOR
-#  Documento fiscal (no nota de entrega). Trae el campo "Origen"
-#  con el numero de OV de Odoo — esto es lo que activa el candado
-#  de duplicados si esa OV ya se importo directo desde Odoo.
-# ============================================================
+def _limpiar(texto: str) -> str:
+    reemplazos = {'á':'a','é':'e','í':'i','ó':'o','ú':'u','ñ':'n',
+                  'Á':'A','É':'E','Í':'I','Ó':'O','Ú':'U','Ñ':'N'}
+    for src, dst in reemplazos.items():
+        texto = texto.replace(src, dst)
+    return re.sub(r'[^\x00-\x7F\n\r\t ]', ' ', texto)
 
-RE_ORIGEN           = re.compile(r'Origen:\s*(\S+)')
-RE_FOLIO            = re.compile(r'Folio\s+(INV/\d+/\d+)')
-RE_FECHA            = re.compile(r'(\d{2})/(\d{2})/(\d{4})')
-RE_RFC_RECEPTOR     = re.compile(r'RFC receptor:\s*(\S+)')
-RE_NOMBRE_RECEPTOR  = re.compile(r'Nombre receptor:\s*(.+?)\s+No\. de serie')
-RE_DIRECCION        = re.compile(r'Direcci[oó]n:\s*(.+?)C[oó]digo postal del receptor', re.S)
-RE_PRODUCTO         = re.compile(r'^(\d{6,10})\s+([A-Z0-9\-]{2,15})\s+([\d,]+\.\d{2,6})\s+H87\s+Unidades\s+')
-
-
-def detectar_factura_ecor(texto: str) -> bool:
-    t = texto.upper()
-    return 'EQUIPOS COREANOS' in t and 'FOLIO FISCAL' in t and 'CONCEPTOS' in t
-
-
-def parsear_factura_ecor(texto: str) -> dict:
+def parsear_ecor(texto: str) -> dict:
+    texto = _limpiar(texto)
     lineas = texto.split('\n')
 
-    m_origen = RE_ORIGEN.search(texto)
-    orden = m_origen.group(1).strip() if m_origen else ''
+    folio = ''
+    m = re.search(r'\b([A-Z]{2,6}-[A-Z]{2,6}/OUT/\d+)\b', texto)
+    if m: folio = m.group(1)
 
-    m_folio = RE_FOLIO.search(texto)
-    folio = m_folio.group(1).replace('/', '-') if m_folio else f"FAC-{int(time.time())}"
+    orden = ''
+    m2 = re.search(r'\b(S\d{5,8})\b', texto)
+    if m2: orden = m2.group(1)
 
-    m_fecha = RE_FECHA.search(texto)
-    fecha = f"{m_fecha.group(3)}-{m_fecha.group(2)}-{m_fecha.group(1)}" if m_fecha else ''
+    fecha = ''
+    m3 = re.search(r'(\d{2}/\d{2}/\d{4})', texto)
+    if m3:
+        p = m3.group(1).split('/')
+        fecha = f"{p[2]}-{p[1]}-{p[0]}"
 
-    m_rfc = RE_RFC_RECEPTOR.search(texto)
-    rfc_cliente = m_rfc.group(1).strip() if m_rfc else ''
+    # Cliente desde "Direccion de envio:"
+    cliente = ''
+    dir_txt = ''
+    for i, l in enumerate(lineas):
+        if re.search(r'direcci[oó]n de env[íi]o', l, re.I):
+            for j in range(i+1, min(i+5, len(lineas))):
+                if lineas[j].strip() and not re.search(r'[aA]venida|[cC]alle|\d{5}', lineas[j]):
+                    cliente = lineas[j].strip()
+                    break
+            dir_parts = [lineas[k].strip() for k in range(i+1, min(i+6, len(lineas))) if lineas[k].strip()]
+            dir_txt = ', '.join(dir_parts[:4])
+            break
 
-    m_nombre = RE_NOMBRE_RECEPTOR.search(texto)
-    nombre_cliente = m_nombre.group(1).strip() if m_nombre else ''
+    # Productos — enfoque por bloques [SKU]
+    EXCLUIR = {'Pagina', 'pagina', 'Producto', 'serie', 'lote', 'Entregado'}
+    bloques = list(re.finditer(r'\[([^\]]+)\]', texto))
+    acumulado = {}
 
-    m_dir = RE_DIRECCION.search(texto)
-    direccion = re.sub(r'\s+', ' ', m_dir.group(1)).strip() if m_dir else ''
-    direccion = re.sub(r'C[oó]digo postal,?\s*fecha y hora\s*\d+.*?\d{2}:\d{2}:\d{2}', '', direccion)
-    direccion = re.sub(r'de emisi[oó]n:\s*', '', direccion)
-    direccion = re.sub(r'\s{2,}', ' ', direccion).strip(' ,')
+    for bi, match in enumerate(bloques):
+        clave = match.group(1).strip()
+        if clave in EXCLUIR: continue
+        inicio = match.end()
+        fin    = bloques[bi+1].start() if bi+1 < len(bloques) else len(texto)
+        bloque = texto[inicio:fin]
 
-    productos = []
-    for i, linea in enumerate(lineas):
-        mp = RE_PRODUCTO.match(linea)
-        if not mp:
-            continue
-        sku = mp.group(2)
-        cantidad = float(mp.group(3).replace(',', ''))
-        if cantidad <= 0:
-            continue
+        idx_u = bloque.find('Unidades')
+        if idx_u == -1: continue
+        antes = bloque[:idx_u]
 
-        descripcion = ''
-        if i + 1 < len(lineas) and 'Descripci' in lineas[i + 1]:
-            md = re.search(r'\[' + re.escape(sku) + r'\]\s*(.+?)\s+Impuesto\s+Tipo\s+Base', lineas[i + 1])
-            if md:
-                descripcion = md.group(1).strip()
-            if i + 2 < len(lineas):
-                mc = re.match(r'^(.+?)\s+Traslado\b', lineas[i + 2])
-                if mc:
-                    cont = mc.group(1).strip()
-                    if cont and not re.match(r'^[\d.,]+$', cont):
-                        descripcion = (descripcion + ' ' + cont).strip()
+        cantidades = list(re.finditer(r'(\d+\.\d{3,4})', antes))
+        if not cantidades: continue
+        cant = float(cantidades[-1].group(1))
+        if cant <= 0 or cant > 100000: continue
 
-        productos.append({
-            'clave':          sku,
-            'descripcion':    (descripcion or sku)[:150],
-            'cantidad_total': int(round(cantidad)),
-            'unidad':         'PZA'
-        })
+        desc = antes[:cantidades[-1].start()].strip()
+        desc = re.sub(r'\s+\d{4,8}(\s+\d{4,8})*\s*$', '', desc).strip()
+        desc = re.sub(r'\s+', ' ', desc).strip()
+
+        if clave in acumulado:
+            acumulado[clave]['cantidad_total'] += int(cant)
+        else:
+            acumulado[clave] = {
+                'clave': clave, 'descripcion': desc[:120],
+                'cantidad_total': int(cant), 'unidad': 'Unidades'
+            }
 
     return {
-        'num_entrega':     folio,
-        'nombre_cliente':  nombre_cliente,
-        'rfc_cliente':     rfc_cliente,
-        'direccion':       direccion,
-        'orden':           orden,
-        'fecha_entrega':   fecha,
-        'comercializador': 'ECOR',
-        'sucursal':        '',
-        'productos':       productos
+        'num_entrega':    folio or f'EC-{__import__("time").time_ns()}',
+        'nombre_cliente': cliente,
+        'rfc_cliente':    '',
+        'direccion':      dir_txt,
+        'orden':          orden,
+        'fecha_entrega':  fecha,
+        'comercializador':'ECOR',
+        'sucursal':       '',
+        'productos':      list(acumulado.values())
     }
