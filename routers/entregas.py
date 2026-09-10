@@ -376,6 +376,8 @@ async def procesar_pdf(
     from parsers.sap_raiker import parsear_sap_raiker
     from parsers.traspaso_raiker import parsear_traspaso_raiker
     from parsers.factura_ecor import parsear_factura_ecor
+    from parsers.sap_transaccion import parsear_sap_transaccion
+    from parsers.tdk_entrega import parsear_tdk_entrega
     from parsers.detector import detectar_tipo
 
     texto = _extraer_texto_pdf(contenido)
@@ -387,6 +389,10 @@ async def procesar_pdf(
         datos = parsear_traspaso_raiker(texto)
     elif tipo == "FACTURA_ECOR":
         datos = parsear_factura_ecor(texto)
+    elif tipo == "SAP_TRANSACCION":
+        datos = parsear_sap_transaccion(texto)
+    elif tipo == "TDK_ENTREGA":
+        datos = parsear_tdk_entrega(texto)
     else:
         datos = parsear_ecor(texto)
 
