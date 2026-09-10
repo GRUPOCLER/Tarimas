@@ -23,6 +23,12 @@ def parsear_sap_raiker(texto: str, nombre_archivo: str = '') -> dict:
         for l in lineas:
             mn = re.match(r'^([\d,]{3,8})$', l)
             if mn: folio = f"TL-{mn.group(1).replace(',','')}"; break
+    if not folio:
+        # A veces el folio viene mezclado en la misma linea que otras
+        # palabras (ej. "Almacen 8,774 09/09/2026") — buscamos un numero
+        # con separador de miles, formato tipico del folio en este documento
+        m3 = re.search(r'\b(\d{1,3},\d{3})\b', texto)
+        if m3: folio = f"TL-{m3.group(1).replace(',','')}"
     if not folio: folio = f"TL-{__import__('time').time_ns()}"
 
     sucursal = ''
@@ -102,7 +108,7 @@ def parsear_sap_raiker(texto: str, nombre_archivo: str = '') -> dict:
         'nombre_cliente': 'AGROINDUSTRIAS RAIKER',
         'rfc_cliente':    '',
         'direccion':      f"Sucursal {sucursal}" if sucursal else 'AGROINDUSTRIAS RAIKER',
-        'orden':          '',
+        'orden':          folio.replace('TL-', '').replace('TL', ''),
         'fecha_entrega':  fecha,
         'comercializador':'Raiker',
         'sucursal':       sucursal,
