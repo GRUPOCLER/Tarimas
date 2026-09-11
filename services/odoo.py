@@ -190,17 +190,50 @@ async def cargar_entrega(picking_ids: list):
     }
 
 # ── TRASPASOS INTERNOS (CEDIS, FULL MELI, Eventos y Expo) ────────
-async def listar_traspasos_pendientes(ubicaciones: list = None):
-    ubicaciones = ubicaciones if ubicaciones is not None else DESTINOS_TRASPASO
-    if not ubicaciones:
+def _frag(x):
+    """Un 'fragmento' de dominio de Odoo: si ya es un compuesto (empieza con
+    &/|/!) se pasa tal cual; si es una sola condicion, ocupa un solo lugar."""
+    if isinstance(x[0], str) and x[0] in ("&", "|", "!"):
+        return x
+    return [x]
+
+def _and(*partes):
+    slots = []
+    for p in partes:
+        slots += _frag(p)
+    return ["&"] * (len(partes) - 1) + slots
+
+def _or(*partes):
+    slots = []
+    for p in partes:
+        slots += _frag(p)
+    return ["|"] * (len(partes) - 1) + slots
+
+async def listar_traspasos_pendientes(destinos: list = None, origenes: list = None):
+    # Compatibilidad: si nadie pasa nada, usa el valor viejo por variable de entorno
+    if destinos is None and origenes is None:
+        destinos = DESTINOS_TRASPASO
+    destinos = destinos or []
+    origenes = origenes or []
+    if not destinos and not origenes:
         return []
+
+    fecha_limite = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
+    leaf_estado = ["state", "not in", ["done", "cancel"]]
+    leaf_fecha  = ["scheduled_date", ">=", fecha_limite]
+
+    rama_destino = _and(["location_dest_id", "child_of", destinos], ["location_id.usage", "in", ["internal", "transit"]])
+    rama_origen  = _and(["location_id", "child_of", origenes], ["location_dest_id.usage", "in", ["internal", "transit"]])
+
+    if destinos and origenes:
+        dominio = _and(leaf_estado, leaf_fecha, _or(rama_destino, rama_origen))
+    elif destinos:
+        dominio = _and(leaf_estado, leaf_fecha, rama_destino)
+    else:
+        dominio = _and(leaf_estado, leaf_fecha, rama_origen)
+
     pickings = await _rpc("stock.picking", "search_read",
-        [[
-            ["location_dest_id", "child_of", ubicaciones],
-            ["location_id.usage", "in", ["internal", "transit"]],
-            ["state", "not in", ["done", "cancel"]],
-            ["scheduled_date", ">=", (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")]
-        ]],
+        [dominio],
         {
             "fields": ["name", "location_id", "location_dest_id", "state", "origin", "move_ids", "scheduled_date"],
             "order": "id desc", "limit": 400
