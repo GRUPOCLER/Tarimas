@@ -239,11 +239,27 @@ async def listar_traspasos_pendientes(destinos: list = None, origenes: list = No
             "order": "id desc", "limit": 400
         }
     )
+
+    # Cuando el traslado es de varios pasos, el "OUT" que encontramos apunta
+    # a una ubicacion de transito generica (ej. "Warehouse Transfer"), no al
+    # almacen destino real. Ese destino real esta en el registro hermano
+    # ".../IN/#####" que comparte la misma referencia ("origin"). Lo buscamos.
+    origenes_ref = list(set(p["origin"] for p in pickings if p.get("origin") and "/OUT/" in p.get("name", "")))
+    destinos_reales = {}
+    if origenes_ref:
+        hermanos = await _rpc("stock.picking", "search_read",
+            [[["origin", "in", origenes_ref], ["name", "like", "/IN/"]]],
+            {"fields": ["origin", "location_dest_id"]}
+        )
+        for h in hermanos:
+            if h.get("origin") and h.get("location_dest_id"):
+                destinos_reales[h["origin"]] = h["location_dest_id"][1]
+
     return [{
         "id":         p["id"],
         "folio":      p["name"],
         "origen":     p["location_id"][1] if p.get("location_id") else "",
-        "destino":    p["location_dest_id"][1] if p.get("location_dest_id") else "",
+        "destino":    destinos_reales.get(p.get("origin"), p["location_dest_id"][1] if p.get("location_dest_id") else ""),
         "estado":     p["state"],
         "referencia": p.get("origin") or "",
         "fecha":      (p.get("scheduled_date") or "")[:10],
