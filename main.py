@@ -54,6 +54,9 @@ async def lifespan(app: FastAPI):
             "DEFAULT (now() AT TIME ZONE 'America/Mexico_City')"
         ))
         await conn.execute(text(
+            "ALTER TABLE almacenes_traspaso ADD COLUMN IF NOT EXISTS tipo VARCHAR(10) DEFAULT 'destino'"
+        ))
+        await conn.execute(text(
             "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ids_entregas_fusionadas TEXT"
         ))
         await conn.execute(text(
