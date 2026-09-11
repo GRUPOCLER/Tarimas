@@ -259,7 +259,9 @@ async def listar_traspasos_pendientes(destinos: list = None, origenes: list = No
         "id":         p["id"],
         "folio":      p["name"],
         "origen":     p["location_id"][1] if p.get("location_id") else "",
-        "destino":    destinos_reales.get(p.get("origin")) or "(se confirma al validar el traslado)",
+        "destino":    destinos_reales.get(p.get("origin")) or (
+            f"{p['location_dest_id'][1]} (tentativo, sin confirmar)" if p.get("location_dest_id") else "(sin destino)"
+        ),
         "estado":     p["state"],
         "referencia": p.get("origin") or "",
         "fecha":      (p.get("scheduled_date") or "")[:10],
