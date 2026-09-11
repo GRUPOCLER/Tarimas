@@ -53,12 +53,19 @@ async def cargar_entrega(picking_ids: list[int], user: dict = Depends(get_curren
 
 @router.get("/traspasos")
 async def listar_traspasos(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
-    result = await db.execute(select(AlmacenTraspaso.odoo_location_id).where(AlmacenTraspaso.activo == True))
-    ubicaciones = [row[0] for row in result.all()]
+    result = await db.execute(
+        select(AlmacenTraspaso.odoo_location_id, AlmacenTraspaso.tipo).where(AlmacenTraspaso.activo == True)
+    )
+    filas = result.all()
+    destinos = [loc for loc, tipo in filas if (tipo or "destino") == "destino"]
+    origenes = [loc for loc, tipo in filas if tipo == "origen"]
 
     try:
-        # Si no hay nada configurado en la BD todavia, cae al valor por defecto del .env
-        traspasos = await odoo_svc.listar_traspasos_pendientes(ubicaciones or None)
+        # Si no hay nada configurado en la BD todavia, cae al valor por defecto del .env (solo destino)
+        if not destinos and not origenes:
+            traspasos = await odoo_svc.listar_traspasos_pendientes(None, None)
+        else:
+            traspasos = await odoo_svc.listar_traspasos_pendientes(destinos, origenes)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -117,7 +124,7 @@ async def listar_almacenes_configurados(db: AsyncSession = Depends(get_db), user
     result = await db.execute(select(AlmacenTraspaso).order_by(AlmacenTraspaso.fecha_agregado.desc()))
     return [{
         "id": a.id, "odoo_warehouse_id": a.odoo_warehouse_id, "odoo_location_id": a.odoo_location_id,
-        "nombre": a.nombre, "codigo": a.codigo, "activo": a.activo,
+        "tipo": a.tipo or "destino", "nombre": a.nombre, "codigo": a.codigo, "activo": a.activo,
         "agregado_por": a.agregado_por, "fecha_agregado": str(a.fecha_agregado or "")
     } for a in result.scalars()]
 
@@ -125,11 +132,16 @@ async def listar_almacenes_configurados(db: AsyncSession = Depends(get_db), user
 async def agregar_almacen(body: dict, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     if user.get("rol") != "admin":
         raise HTTPException(status_code=403, detail="Solo un Administrador puede configurar esto")
-    existe = await db.execute(select(AlmacenTraspaso).where(AlmacenTraspaso.odoo_warehouse_id == body["odoo_warehouse_id"]))
+    tipo = body.get("tipo") if body.get("tipo") in ("destino", "origen") else "destino"
+    # Un mismo almacen SI puede vigilarse como destino y como origen a la vez,
+    # solo se bloquea si ya esta agregado con exactamente el mismo tipo
+    existe = await db.execute(
+        select(AlmacenTraspaso).where(AlmacenTraspaso.odoo_warehouse_id == body["odoo_warehouse_id"], AlmacenTraspaso.tipo == tipo)
+    )
     if existe.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Ese almacen ya esta agregado")
+        raise HTTPException(status_code=409, detail=f"Ese almacen ya esta agregado como {tipo}")
     nuevo = AlmacenTraspaso(
-        odoo_warehouse_id=body["odoo_warehouse_id"], odoo_location_id=body["odoo_location_id"],
+        odoo_warehouse_id=body["odoo_warehouse_id"], odoo_location_id=body["odoo_location_id"], tipo=tipo,
         nombre=body.get("nombre", ""), codigo=body.get("codigo", ""), activo=True, agregado_por=user["sub"]
     )
     db.add(nuevo)
