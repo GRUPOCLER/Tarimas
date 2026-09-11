@@ -117,18 +117,26 @@ def _detectar_sucursal_raiker(nombre_contacto: str) -> str:
 async def cargar_entrega(picking_ids: list):
     picks = await _rpc("stock.picking", "search_read",
         [[["id", "in", picking_ids]]],
-        {"fields": ["name", "partner_id", "sale_id", "move_ids"]}
+        {"fields": ["name", "partner_id", "sale_id", "move_ids", "state"]}
     )
     if not picks:
         raise Exception("La OV no tiene entregas")
     p = picks[0]
+    validada = p.get("state") == "done"
     moves = await _rpc("stock.move", "search_read",
         [[["id", "in", p["move_ids"]]]],
-        {"fields": ["product_id", "product_uom_qty", "name"]}
+        {"fields": ["product_id", "product_uom_qty", "quantity", "name"]}
     )
     productos = []
     for m in moves:
-        if m["product_uom_qty"] <= 0:
+        # Si la entrega ya esta validada ("Hecho"), usamos la cantidad REAL
+        # que se surtio (campo "quantity") — no lo que se pidio originalmente
+        # ("product_uom_qty"/Demanda). Asi los productos que no se pudieron
+        # surtir (faltante de stock, etc.) no salen en las etiquetas.
+        # Si todavia no esta validada, no hay cantidad real aun, usamos la
+        # demanda como respaldo (comportamiento anterior).
+        cantidad = m.get("quantity", 0) if validada else m.get("product_uom_qty", 0)
+        if cantidad <= 0:
             continue
         nombre = m["product_id"][1] if m.get("product_id") else m["name"]
         match = re.match(r"^\[([^\]]+)\]", nombre)
@@ -136,7 +144,7 @@ async def cargar_entrega(picking_ids: list):
         desc  = nombre.replace(match.group(0), "").strip() if match else nombre
         productos.append({
             "clave": clave, "descripcion": desc,
-            "cantidad_total": round(m["product_uom_qty"]), "unidad": "PZA"
+            "cantidad_total": round(cantidad), "unidad": "PZA"
         })
 
     # Direccion de entrega real: viene del campo "partner_shipping_id" de la
