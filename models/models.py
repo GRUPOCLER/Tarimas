@@ -179,6 +179,7 @@ class AlmacenTraspaso(Base):
     id                 = Column(Integer, primary_key=True, autoincrement=True)
     odoo_warehouse_id  = Column(Integer, nullable=False)
     odoo_location_id   = Column(Integer, nullable=False)  # view_location_id, para el filtro child_of
+    tipo               = Column(String(10), default="destino")  # "destino" | "origen"
     nombre             = Column(String(120))
     codigo             = Column(String(30))
     activo             = Column(Boolean, default=True)
