@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import Optional, List
@@ -69,6 +69,9 @@ class EntregaIn(BaseModel):
     sucursal:       Optional[str] = ""
     fuente:         Optional[str] = "manual"
     productos:      List[ProductoIn]
+
+class EliminarEntregaIn(BaseModel):
+    motivo: str
 
 class CrearTarimaIn(BaseModel):
     peso_palet_kg: Optional[float] = 0
@@ -264,6 +267,43 @@ async def fusion_detalle(
         "total_pendiente": total_pendiente,
     }
 
+
+@router.delete("/{id_entrega}")
+async def eliminar_entrega(
+    id_entrega: str,
+    body:       EliminarEntregaIn,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    if user.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un Administrador puede eliminar entregas")
+    if not body.motivo or not body.motivo.strip():
+        raise HTTPException(status_code=400, detail="Debes escribir un motivo para eliminar la entrega")
+
+    result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = result.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+
+    # Borrar en el orden correcto para no violar llaves foraneas:
+    # detalle de tarimas -> tarimas -> productos -> la entrega
+    tarimas_r = await db.execute(select(Tarima.id_tarima).where(Tarima.id_entrega == id_entrega))
+    ids_tarimas = [r[0] for r in tarimas_r.all()]
+    if ids_tarimas:
+        await db.execute(delete(DetalleTarima).where(DetalleTarima.id_tarima.in_(ids_tarimas)))
+        await db.execute(delete(Tarima).where(Tarima.id_entrega == id_entrega))
+    await db.execute(delete(Producto).where(Producto.id_entrega == id_entrega))
+
+    # Bitacora con el motivo, para poder auditar despues quien elimino que y por que
+    db.add(LogAcceso(
+        usuario=user["sub"], accion="eliminar_entrega",
+        detalle=f"Elimino la entrega {entrega.num_entrega or id_entrega} ({id_entrega}). Motivo: {body.motivo.strip()}",
+        exito=True
+    ))
+
+    await db.delete(entrega)
+    await db.commit()
+    return {"ok": True}
 
 @router.get("/{id_entrega}")
 async def detalle_entrega(
@@ -720,10 +760,13 @@ async def etiqueta_tarima(
 async def etiquetas_sueltas(
     id_entrega: str,
     master:     Optional[str] = None,  # claves separadas por coma que SI usan caja master
+    solo:       Optional[str] = None,  # ids de producto separados por coma — si viene, solo imprime esos
+    motivo:     Optional[str] = None,  # obligatorio cuando "solo" deja productos fuera
     db:         AsyncSession = Depends(get_db),
     user:       dict = Depends(get_current_user)
 ):
     skus_master = set(s.strip().upper() for s in (master or "").split(",") if s.strip())
+    ids_solo = set(s.strip() for s in (solo or "").split(",") if s.strip())
     result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
     entrega = result.scalar_one_or_none()
     if not entrega:
@@ -732,7 +775,28 @@ async def etiquetas_sueltas(
     prods_r = await db.execute(select(Producto).where(Producto.id_entrega == id_entrega))
     todos = list(prods_r.scalars())
     # Solo lo que sigue pendiente (no asignado a ninguna tarima) se imprime como suelto
-    productos = [p for p in todos if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
+    productos_pendientes = [p for p in todos if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
+    productos = productos_pendientes
+    # Si se marcaron productos especificos, solo esos — el resto del pedido
+    # (lo que no va fisicamente en esta entrega) se queda fuera de la impresion.
+    # Si en efecto deja algo fuera, exigimos motivo para que quede asentado
+    # por que esta entrega no sale completa, y lo guardamos en la Bitacora.
+    if ids_solo:
+        productos = [p for p in productos_pendientes if p.id_producto in ids_solo]
+        if not productos:
+            raise HTTPException(status_code=422, detail="Los productos seleccionados ya no estan pendientes o no existen")
+        es_parcial = len(productos) < len(productos_pendientes)
+        if es_parcial:
+            if not motivo or not motivo.strip():
+                raise HTTPException(status_code=400, detail="Debes indicar el motivo de la entrega parcial")
+            excluidos = [p.clave for p in productos_pendientes if p.id_producto not in ids_solo]
+            db.add(LogAcceso(
+                usuario=user["sub"], accion="entrega_parcial",
+                detalle=f"Imprimio etiquetas sueltas parciales de {entrega.num_entrega or id_entrega}. "
+                        f"Quedaron fuera: {', '.join(excluidos)}. Motivo: {motivo.strip()}",
+                exito=True
+            ))
+            await db.commit()
     if not productos:
         raise HTTPException(status_code=404, detail="No hay productos pendientes de asignar (todo esta en tarimas)")
 
