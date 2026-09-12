@@ -63,13 +63,25 @@ async def mis_solicitudes(
     db:   AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user)
 ):
-    result = await db.execute(
+    r1 = await db.execute(
         select(SolicitudReimpresion)
         .where(SolicitudReimpresion.solicitado_por == user["sub"])
         .order_by(SolicitudReimpresion.fecha_solicitud.desc())
         .limit(20)
     )
-    return [_ser(s) for s in result.scalars()]
+    reimpresiones = [{**_ser(s), "categoria": "reimpresion"} for s in r1.scalars()]
+
+    r2 = await db.execute(
+        select(SolicitudCambioSistema)
+        .where(SolicitudCambioSistema.solicitado_por == user["sub"])
+        .order_by(SolicitudCambioSistema.fecha_solicitud.desc())
+        .limit(20)
+    )
+    cambios = [{**_ser_cambio(s), "categoria": "cambio_sistema"} for s in r2.scalars()]
+
+    todas = reimpresiones + cambios
+    todas.sort(key=lambda s: s["fecha_solicitud"], reverse=True)
+    return todas[:20]
 
 # ── APROBAR ────────────────────────────────────────────────────
 @router.post("/{id_solicitud}/aprobar")
