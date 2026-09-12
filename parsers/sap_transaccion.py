@@ -21,8 +21,8 @@ RE_FECHA   = re.compile(r'Fecha\s+(\d{1,2})/(\d{2})/(\d{4})')
 RE_ORIGEN  = re.compile(r'De almac[eé]n\s+([A-Z0-9\-]+)', re.I)
 RE_COMENT  = re.compile(r'Comentarios\s+(.+?)(?:\n|$)')
 RE_FILA    = re.compile(
-    r'^(\d+)\s+([A-Z0-9\-]+)\s+([A-Z][A-Z0-9\-]{1,14})\s+'
-    r'(PZA|PZAS|PZ|KG|LTS?|UND|CAJA)\s+([\d,]+(?:\.\d+)?)\s+MXP\s+([\d,]+\.\d+)\s+([\d,]+(?:\.\d+)?)\s*$'
+    r'^(\d+)\s+([A-Z0-9\-]+)\s+(.*?)\s*([A-Z][A-Z0-9\-]{1,14})\s*'
+    r'(PZA|PZAS|PZ|KG|LTS?|UND|CAJA)\s+([\d,]+(?:\.\d+)?)\s*MXP\s+([\d,]+\.\d+)\s+([\d,]+(?:\.\d+)?)\s*$'
 )
 
 STOP_LINEA = ('REPRESENTANTE', 'COMENTARIOS', 'PÁGINA', 'PAGINA', 'DE ALMACÉN', 'DE ALMACEN',
@@ -61,17 +61,20 @@ def parsear_sap_transaccion(texto: str) -> dict:
         m = RE_FILA.match(linea)
         if not m:
             continue
-        clave    = m.group(2).strip()
-        almacen  = m.group(3).strip()
-        cantidad = float(m.group(5).replace(',', ''))
+        clave      = m.group(2).strip()
+        desc_medio = m.group(3).strip()  # texto de descripcion metido en medio del renglon (si lo hay)
+        almacen    = m.group(4).strip()
+        cantidad   = float(m.group(6).replace(',', ''))
         if cantidad <= 0:
             continue
         almacenes_destino.append(almacen)
 
-        # Descripcion: linea de arriba + linea de abajo (si no son stop/otra fila)
+        # Descripcion: linea de arriba + texto de en medio (si lo hay) + linea de abajo
         partes = []
         if i - 1 >= 0 and not _es_stop(lineas_no_vacias[i - 1]) and not RE_FILA.match(lineas_no_vacias[i - 1]):
             partes.append(lineas_no_vacias[i - 1])
+        if desc_medio:
+            partes.append(desc_medio)
         if i + 1 < len(lineas_no_vacias) and not _es_stop(lineas_no_vacias[i + 1]) and not RE_FILA.match(lineas_no_vacias[i + 1]):
             partes.append(lineas_no_vacias[i + 1])
         descripcion = re.sub(r'\s+', ' ', ' '.join(partes)).strip() or clave
