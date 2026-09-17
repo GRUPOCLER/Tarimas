@@ -68,6 +68,7 @@ class EntregaIn(BaseModel):
     comercializador:Optional[str] = ""
     sucursal:       Optional[str] = ""
     fuente:         Optional[str] = "manual"
+    forzar:         Optional[bool] = False  # si True, ignora el candado de folio duplicado
     productos:      List[ProductoIn]
 
 class EliminarEntregaIn(BaseModel):
@@ -371,12 +372,12 @@ async def crear_entrega(
         from sqlalchemy import or_
         dup = await db.execute(select(Entrega).where(or_(*condiciones)))
         existente = dup.scalars().first()
-        if existente:
+        if existente and not body.forzar:
             raise HTTPException(
                 status_code=409,
                 detail=f"Ya existe una entrega para '{body.num_entrega or body.orden}' "
                        f"(folio {existente.id_entrega}, sistema {existente.sistema}). "
-                       f"No se puede registrar de nuevo en otro sistema."
+                       f"Si es correcto, confirma para registrarla de todas formas."
             )
 
     id_e = _gen_id_entrega(body.sistema)
@@ -417,6 +418,7 @@ async def procesar_pdf(
     archivo:   UploadFile = File(...),
     sistema:   str = "CS",
     comercializador: str = "",
+    forzar:    bool = False,
     db:        AsyncSession = Depends(get_db),
     user:      dict = Depends(get_current_user)
 ):
@@ -451,6 +453,7 @@ async def procesar_pdf(
     datos["sistema"]  = sistema
     datos["fuente"]   = "pdf"
     datos["comercializador"] = datos.get("comercializador") or comercializador
+    datos["forzar"]   = forzar
     body = EntregaIn(**datos)
     return await crear_entrega(body, db, user)
 
