@@ -156,7 +156,7 @@ async def importar_layout(
             db.add(u)
 
         u.bodega              = el.get("bodega")
-        u.rack                = el.get("rack")
+        u.rack                = str(el.get("rack")) if el.get("rack") is not None else None
         u.lado                = el.get("lado")
         u.tramo                = el.get("tramo")
         u.nivel                = el.get("nivel")
