@@ -205,7 +205,7 @@ class UbicacionAlmacen(Base):
     __tablename__ = "ubicaciones_almacen"
     codigo               = Column(String(40), primary_key=True)  # ej. "PTR64BT12N02"
     bodega               = Column(String(50))
-    rack                 = Column(Integer)
+    rack                 = Column(String(10))  # texto, no numero — algunas ubicaciones (Patio) traen "-"
     lado                 = Column(String(5))
     tramo                = Column(Integer)
     nivel                = Column(Integer)
