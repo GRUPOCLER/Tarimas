@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -7,7 +8,7 @@ from sqlalchemy import text
 load_dotenv()
 
 from database import engine, Base
-from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin, reimpresiones
+from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin, reimpresiones, almacen
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -111,9 +112,14 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
+    # ORIGENES_PERMITIDOS: URLs del frontend, separadas por coma, via
+    # variable de entorno — asi cada ambiente (produccion, staging) usa
+    # la suya sin tener que tocar el codigo cada vez.
     allow_origins=[
-        "https://cler-frontend-production.up.railway.app",
-        "http://localhost:5173",  # desarrollo local
+        o.strip() for o in os.getenv(
+            "ORIGENES_PERMITIDOS",
+            "https://cler-frontend-production.up.railway.app,http://localhost:5173"
+        ).split(",") if o.strip()
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -128,6 +134,7 @@ app.include_router(setup.router,     prefix="/api/setup",     tags=["setup"])
 app.include_router(odoo.router,      prefix="/api/odoo",      tags=["odoo"])
 app.include_router(admin.router,     prefix="/api/admin",     tags=["admin"])
 app.include_router(reimpresiones.router, prefix="/api/reimpresiones", tags=["reimpresiones"])
+app.include_router(almacen.router,   prefix="/api/almacen",   tags=["almacen"])
 
 @app.get("/")
 def root():
