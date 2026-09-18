@@ -344,3 +344,23 @@ async def cargar_traspaso(picking_id: int):
         "fuente":          "odoo",
         "productos":       productos
     }
+
+# ── PRODUCTOS COMERCIALIZABLES (para asignar ubicacion en el almacen) ──
+async def buscar_productos_venta(termino: str = "", limite: int = 50):
+    """Busca productos que se pueden vender (sale_ok=True) en Odoo, para
+    poder asignarles despues una ubicacion fisica en el mapa del CEDIS."""
+    dominio = [["sale_ok", "=", True]]
+    if termino:
+        t = termino.strip()
+        dominio.append("|")
+        dominio.append(["default_code", "ilike", t])
+        dominio.append(["name", "ilike", t])
+    productos = await _rpc("product.product", "search_read",
+        [dominio],
+        {"fields": ["default_code", "name", "qty_available"], "limit": limite, "order": "name"}
+    )
+    return [{
+        "clave":           p.get("default_code") or "",
+        "nombre":          p.get("name") or "",
+        "existencia_odoo": p.get("qty_available", 0),
+    } for p in productos if p.get("default_code")]
