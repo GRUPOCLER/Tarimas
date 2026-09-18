@@ -196,3 +196,32 @@ class UsuarioAlmacen(Base):
     codigo             = Column(String(30))
     agregado_por       = Column(String(50))
     fecha_agregado     = Column(DateTime, server_default=func.now())
+
+# ── UBICACIONES FISICAS DEL ALMACEN (mapa CEDIS Paso del Toro) ──────
+# Cada renglon es una posicion real de rack (bodega/rack/lado/tramo/nivel),
+# con el producto que tiene asignado ahi y cuanto stock hay en ese lugar.
+# El geometrico (x/y/ancho/alto) se usa para dibujar el mapa visual (fase 2).
+class UbicacionAlmacen(Base):
+    __tablename__ = "ubicaciones_almacen"
+    codigo               = Column(String(40), primary_key=True)  # ej. "PTR64BT12N02"
+    bodega               = Column(String(50))
+    rack                 = Column(Integer)
+    lado                 = Column(String(5))
+    tramo                = Column(Integer)
+    nivel                = Column(Integer)
+    zona                 = Column(String(20))   # BRONCE / PLATA / ORO, etc.
+    capacidad            = Column(Integer, default=1)
+    distancia_embarques  = Column(Float, default=0)
+    x                    = Column(Float, default=0)
+    y                    = Column(Float, default=0)
+    ancho                = Column(Float, default=1)
+    alto                 = Column(Float, default=1)
+    # Asignacion de producto — una ubicacion puede compartir hasta 2 SKUs
+    producto             = Column(String(40), nullable=True, index=True)
+    producto_desc        = Column(String(200), nullable=True)
+    producto2            = Column(String(40), nullable=True, index=True)
+    producto2_desc       = Column(String(200), nullable=True)
+    stock                = Column(Integer, default=0)
+    notas                = Column(Text, nullable=True)
+    asignado_por         = Column(String(50), nullable=True)
+    actualizado          = Column(DateTime, server_default=func.now())
