@@ -348,8 +348,10 @@ async def cargar_traspaso(picking_id: int):
 # ── PRODUCTOS COMERCIALIZABLES (para asignar ubicacion en el almacen) ──
 async def buscar_productos_venta(termino: str = "", limite: int = 50):
     """Busca productos que se pueden vender (sale_ok=True) en Odoo, para
-    poder asignarles despues una ubicacion fisica en el mapa del CEDIS."""
-    dominio = [["sale_ok", "=", True]]
+    poder asignarles despues una ubicacion fisica en el mapa del CEDIS.
+    Solo se muestran productos con la etiqueta "Maquinaria" (product_tag_ids),
+    ya que este almacen es especificamente para ese tipo de producto."""
+    dominio = [["sale_ok", "=", True], ["product_tag_ids.name", "=", "Maquinaria"]]
     if termino:
         t = termino.strip()
         dominio.append("|")
