@@ -25,6 +25,7 @@ def _ser(u: UbicacionAlmacen) -> dict:
         "codigo": u.codigo, "bodega": u.bodega, "rack": u.rack, "lado": u.lado,
         "tramo": u.tramo, "nivel": u.nivel, "zona": u.zona, "capacidad": u.capacidad,
         "distancia_embarques": u.distancia_embarques,
+        "x": u.x, "y": u.y, "ancho": u.ancho, "alto": u.alto,
         "producto": u.producto, "producto_desc": u.producto_desc,
         "producto2": u.producto2, "producto2_desc": u.producto2_desc,
         "stock": u.stock, "notas": u.notas,
@@ -39,6 +40,7 @@ async def listar_ubicaciones(
     zona:   Optional[str] = None,
     solo_libres: bool = False,
     solo_ocupadas: bool = False,
+    solo_con_stock: bool = False,
     limite: int = 200,
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user)
@@ -59,7 +61,16 @@ async def listar_ubicaciones(
         q = q.where(UbicacionAlmacen.producto.is_(None))
     if solo_ocupadas:
         q = q.where(UbicacionAlmacen.producto.is_not(None))
+    if solo_con_stock:
+        q = q.where(UbicacionAlmacen.stock > 0)
     result = await db.execute(q)
+    return [_ser(u) for u in result.scalars()]
+
+# ── MAPA: todas las ubicaciones con su geometria, para dibujar
+# el plano visual del CEDIS completo de una sola vez ─────────
+@router.get("/mapa")
+async def mapa_almacen(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    result = await db.execute(select(UbicacionAlmacen))
     return [_ser(u) for u in result.scalars()]
 
 @router.get("/ubicaciones/{codigo}")
