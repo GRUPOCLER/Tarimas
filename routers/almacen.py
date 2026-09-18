@@ -101,7 +101,10 @@ async def asignar_producto(
     codigo: str, body: AsignarIn,
     db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)
 ):
-    if user.get("rol") not in ("admin", "gerente"):
+    # Igual que en la version anterior del mapa (admin + editor podian escribir
+    # el inventario): cualquier usuario autenticado puede asignar/editar aqui,
+    # no solo admin/gerente.
+    if user.get("rol") not in ("admin", "gerente", "operador"):
         raise HTTPException(status_code=403, detail="Requiere admin o gerente")
     result = await db.execute(select(UbicacionAlmacen).where(UbicacionAlmacen.codigo == codigo))
     u = result.scalar_one_or_none()
