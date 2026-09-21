@@ -97,6 +97,17 @@ async def aprobar(
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     if s.estatus != "pendiente":
         raise HTTPException(status_code=400, detail="Esta solicitud ya fue resuelta")
+
+    # Si es una solicitud de reapertura de tarima/caja, aplicar el cambio
+    # directo al aprobar (igual que ya hacemos con cambio de sistema)
+    if s.tipo == "REAPERTURA":
+        from models.models import Tarima
+        tar_r = await db.execute(select(Tarima).where(Tarima.id_tarima == s.referencia, Tarima.id_entrega == s.id_entrega))
+        tarima = tar_r.scalar_one_or_none()
+        if tarima:
+            tarima.estatus = "abierta"
+            tarima.fecha_cierre = None
+
     s.estatus = "aprobada"
     s.autorizado_por = user["sub"]
     s.fecha_resolucion = datetime.utcnow()
