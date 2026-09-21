@@ -1073,6 +1073,52 @@ async def cerrar_tarima(
     return {"ok": True}
 
 # ── REABRIR TARIMA (solo Gerente/Admin) ─────────────────────────
+class SolicitarReaperturaIn(BaseModel):
+    motivo: str
+
+@router.post("/{id_entrega}/tarimas/{id_tarima}/solicitar-reapertura")
+async def solicitar_reapertura_tarima(
+    id_entrega: str,
+    id_tarima:  str,
+    body:       SolicitarReaperturaIn,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    if not body.motivo or not body.motivo.strip():
+        raise HTTPException(status_code=400, detail="Debes indicar el motivo de la reapertura")
+
+    result = await db.execute(select(Tarima).where(Tarima.id_tarima == id_tarima, Tarima.id_entrega == id_entrega))
+    tarima = result.scalar_one_or_none()
+    if not tarima:
+        raise HTTPException(status_code=404, detail="Tarima no encontrada")
+    if tarima.estatus != "cerrada":
+        raise HTTPException(status_code=400, detail="Esta tarima/caja no esta cerrada")
+
+    ent_r = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = ent_r.scalar_one_or_none()
+
+    # Admin/Gerente pueden reabrir directo (ya tienen el permiso via el
+    # endpoint /reabrir de abajo); un Operador queda pendiente de aprobacion.
+    if user.get("rol") in ("admin", "gerente"):
+        tarima.estatus = "abierta"
+        tarima.fecha_cierre = None
+        db.add(SolicitudReimpresion(
+            id=_gen_id_solicitud(), tipo="REAPERTURA", id_entrega=id_entrega, referencia=id_tarima,
+            num_entrega=entrega.num_entrega if entrega else id_entrega,
+            motivo=body.motivo.strip(), solicitado_por=user["sub"],
+            estatus="aprobada", autorizado_por=user["sub"], fecha_resolucion=datetime.utcnow()
+        ))
+        await db.commit()
+        return {"ok": True, "abierta_directo": True}
+
+    db.add(SolicitudReimpresion(
+        id=_gen_id_solicitud(), tipo="REAPERTURA", id_entrega=id_entrega, referencia=id_tarima,
+        num_entrega=entrega.num_entrega if entrega else id_entrega,
+        motivo=body.motivo.strip(), solicitado_por=user["sub"], estatus="pendiente"
+    ))
+    await db.commit()
+    return {"ok": True, "abierta_directo": False}
+
 @router.post("/{id_entrega}/tarimas/{id_tarima}/reabrir")
 async def reabrir_tarima(
     id_entrega: str,
