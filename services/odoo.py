@@ -83,7 +83,7 @@ async def listar_ovs_pendientes(warehouse_ids: list = None):
         dominio.append(["warehouse_id", "in", warehouse_ids])
     ovs = await _rpc("sale.order", "search_read",
         [dominio],
-        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id"], "order": "id desc", "limit": 1500}
+        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id"], "order": "date_order desc", "limit": 3000}
     )
     return [{
         "num_ov": ov["name"],
@@ -344,3 +344,25 @@ async def cargar_traspaso(picking_id: int):
         "fuente":          "odoo",
         "productos":       productos
     }
+
+# ── PRODUCTOS COMERCIALIZABLES (para asignar ubicacion en el almacen) ──
+async def buscar_productos_venta(termino: str = "", limite: int = 50):
+    """Busca productos que se pueden vender (sale_ok=True) en Odoo, para
+    poder asignarles despues una ubicacion fisica en el mapa del CEDIS.
+    Solo se muestran productos con la etiqueta "Maquinaria" (product_tag_ids),
+    ya que este almacen es especificamente para ese tipo de producto."""
+    dominio = [["sale_ok", "=", True], ["product_tag_ids.name", "=", "Maquinaria"]]
+    if termino:
+        t = termino.strip()
+        dominio.append("|")
+        dominio.append(["default_code", "ilike", t])
+        dominio.append(["name", "ilike", t])
+    productos = await _rpc("product.product", "search_read",
+        [dominio],
+        {"fields": ["default_code", "name", "qty_available"], "limit": limite, "order": "name"}
+    )
+    return [{
+        "clave":           p.get("default_code") or "",
+        "nombre":          p.get("name") or "",
+        "existencia_odoo": p.get("qty_available", 0),
+    } for p in productos if p.get("default_code")]
