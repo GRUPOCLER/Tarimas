@@ -83,7 +83,7 @@ async def listar_ovs_pendientes(warehouse_ids: list = None):
         dominio.append(["warehouse_id", "in", warehouse_ids])
     ovs = await _rpc("sale.order", "search_read",
         [dominio],
-        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id"], "order": "date_order desc", "limit": 3000}
+        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id"], "order": "date_order desc", "limit": 5000}
     )
     return [{
         "num_ov": ov["name"],
