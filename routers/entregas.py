@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import io, re, time
+import io, re, time, uuid
 
 from database import get_db
 from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso, SolicitudReimpresion, SolicitudCambioSistema, CatalogoItem
@@ -1327,7 +1327,8 @@ async def _controlar_impresion(db: AsyncSession, user: dict, veces_previas: int,
     raise HTTPException(status_code=403, detail="Solicitud enviada. Debe ser autorizada por un Gerente antes de imprimir.")
 
 def _gen_id_solicitud() -> str:
-    return f"SR-{int(time.time()*1000) % 100000000}"
+    # uuid: evita IDs repetidos cuando se crean varias solicitudes en el mismo milisegundo
+    return f"SR-{uuid.uuid4().hex[:14]}"
 
 @router.post("/{id_entrega}/tarimas/{id_tarima}/marcar-impresa")
 async def marcar_impresa_tarima(
@@ -1351,6 +1352,37 @@ async def marcar_impresa_tarima(
     tarima.impresa_veces = (tarima.impresa_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": tarima.impresa_veces}
+
+class MarcarImpresoLoteIn(BaseModel):
+    ids_tarimas: List[str]
+    motivo: Optional[str] = None
+
+@router.post("/{id_entrega}/tarimas/marcar-impresa-lote")
+async def marcar_impresa_lote(
+    id_entrega: str,
+    body:       MarcarImpresoLoteIn,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    """Imprimir todas las etiquetas de una entrega = UNA sola autorizacion (todo o nada)."""
+    if not body.ids_tarimas:
+        raise HTTPException(status_code=400, detail="No hay tarimas para imprimir")
+    result = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega, Tarima.id_tarima.in_(body.ids_tarimas)))
+    tarimas = result.scalars().all()
+    if not tarimas:
+        raise HTTPException(status_code=404, detail="Tarimas no encontradas")
+    ent_r = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = ent_r.scalar_one_or_none()
+    previas = max((t.impresa_veces or 0) for t in tarimas)
+    await _controlar_impresion(db, user, previas, body.motivo, "TARIMA", f"LOTE-{id_entrega}",
+                                id_entrega, entrega.num_entrega if entrega else "")
+    for t in tarimas:
+        if not t.impresa_veces:
+            t.primera_impresion_en  = datetime.utcnow()
+            t.primera_impresion_por = user["sub"]
+        t.impresa_veces = (t.impresa_veces or 0) + 1
+    await db.commit()
+    return {"ok": True, "tarimas": len(tarimas)}
 
 @router.post("/{id_entrega}/etiquetas-sueltas/marcar-impresa")
 async def marcar_impresa_sueltas(
