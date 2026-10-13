@@ -42,7 +42,8 @@ async def contar_pendientes(
     return {"pendientes": result.scalar() or 0}
 
 def _gen_id_solicitud() -> str:
-    return f"SR-{int(time.time()*1000) % 100000000}"
+    import uuid
+    return f"SR-{uuid.uuid4().hex[:14]}"
 
 # ── LISTAR SOLICITUDES ────────────────────────────────────────
 @router.get("/")
