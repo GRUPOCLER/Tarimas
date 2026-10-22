@@ -15,6 +15,7 @@ class SetupRequest(BaseModel):
 
 @router.post("/inicial")
 async def setup_inicial(req: SetupRequest, db: AsyncSession = Depends(get_db)):
+    # Solo funciona si NO hay usuarios en la BD (primera vez)
     total = await db.execute(select(func.count(Usuario.id)))
     if (total.scalar() or 0) > 0:
         raise HTTPException(

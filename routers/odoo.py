@@ -9,20 +9,16 @@ from services import odoo as odoo_svc
 
 router = APIRouter()
 
-@router.get("/ovs")
-async def listar_ovs(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
-    warehouse_ids = None
-    if user.get("rol") != "admin":
-        result = await db.execute(select(UsuarioAlmacen.odoo_warehouse_id).where(UsuarioAlmacen.usuario == user["sub"]))
-        asignados = [row[0] for row in result.all()]
-        if asignados:  # solo restringe si el usuario tiene almacenes configurados
-            warehouse_ids = asignados
-    try:
-        ovs = await odoo_svc.listar_ovs_pendientes(warehouse_ids)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def _almacenes_del_usuario(db: AsyncSession, user: dict):
+    """Almacenes a los que el usuario esta restringido (None = sin restriccion)."""
+    if user.get("rol") == "admin":
+        return None
+    result = await db.execute(select(UsuarioAlmacen.odoo_warehouse_id).where(UsuarioAlmacen.usuario == user["sub"]))
+    asignados = [row[0] for row in result.all()]
+    return asignados or None  # solo restringe si el usuario tiene almacenes configurados
 
-    # Cruzar contra entregas ya existentes en el sistema (por num de OV o folio)
+async def _marcar_importadas(db: AsyncSession, ovs: list):
+    """Cruza las OVs contra entregas ya existentes en el sistema (por num de OV o folio)."""
     nombres = [ov["num_ov"].strip().upper() for ov in ovs if ov.get("num_ov")]
     existentes = {}
     if nombres:
@@ -41,8 +37,27 @@ async def listar_ovs(db: AsyncSession = Depends(get_db), user: dict = Depends(ge
         ov["ya_importada"] = match is not None
         ov["id_entrega_existente"] = match["id_entrega"] if match else None
         ov["sistema_existente"] = match["sistema"] if match else None
-
     return ovs
+
+@router.get("/ovs")
+async def listar_ovs(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    warehouse_ids = await _almacenes_del_usuario(db, user)
+    try:
+        ovs = await odoo_svc.listar_ovs_pendientes(warehouse_ids)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return await _marcar_importadas(db, ovs)
+
+# Busqueda directa en Odoo por numero de OV o cliente: encuentra OVs que la
+# lista general no trae (mas viejas de 45 dias, o fuera del tope de resultados)
+@router.get("/ovs/buscar")
+async def buscar_ovs(q: str = "", db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    warehouse_ids = await _almacenes_del_usuario(db, user)
+    try:
+        ovs = await odoo_svc.buscar_ovs(q, warehouse_ids)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return await _marcar_importadas(db, ovs)
 
 @router.post("/entrega")
 async def cargar_entrega(picking_ids: list[int], user: dict = Depends(get_current_user)):

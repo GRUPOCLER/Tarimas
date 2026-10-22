@@ -76,6 +76,18 @@ async def _uid(client: httpx.AsyncClient):
     _uid_cache["uid"] = uid
     return uid
 
+def _formato_ov(ov: dict) -> dict:
+    return {
+        "num_ov": ov["name"],
+        "cliente": ov["partner_id"][1] if ov.get("partner_id") else "",
+        "comercializador": PARTNER_MAP.get(ov["partner_id"][0] if ov.get("partner_id") else None, ""),
+        "fecha": (ov.get("date_order") or "")[:10],
+        "almacen": ov["warehouse_id"][1] if ov.get("warehouse_id") else "",
+        "picking_ids": ov["picking_ids"]
+    }
+
+_CAMPOS_OV = ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id"]
+
 async def listar_ovs_pendientes(warehouse_ids: list = None):
     fecha_limite = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
     dominio = [["picking_ids", "!=", False], ["state", "in", ["sale", "done"]], ["date_order", ">=", fecha_limite]]
@@ -83,16 +95,28 @@ async def listar_ovs_pendientes(warehouse_ids: list = None):
         dominio.append(["warehouse_id", "in", warehouse_ids])
     ovs = await _rpc("sale.order", "search_read",
         [dominio],
-        {"fields": ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id"], "order": "date_order desc", "limit": 5000}
+        {"fields": _CAMPOS_OV, "order": "date_order desc", "limit": 5000}
     )
-    return [{
-        "num_ov": ov["name"],
-        "cliente": ov["partner_id"][1] if ov.get("partner_id") else "",
-        "comercializador": PARTNER_MAP.get(ov["partner_id"][0] if ov.get("partner_id") else None, ""),
-        "fecha": (ov.get("date_order") or "")[:10],
-        "almacen": ov["warehouse_id"][1] if ov.get("warehouse_id") else "",
-        "picking_ids": ov["picking_ids"]
-    } for ov in ovs]
+    return [_formato_ov(ov) for ov in ovs]
+
+async def buscar_ovs(termino: str, warehouse_ids: list = None, limite: int = 30):
+    """Busca OVs directo en Odoo por numero (o cliente), SIN la ventana de 45
+    dias ni el tope de la lista general. Asi cualquier OV confirmada con
+    entregas se puede encontrar, sin importar que tan vieja sea."""
+    t = (termino or "").strip()
+    if len(t) < 3:
+        return []
+    dominio = [
+        ["picking_ids", "!=", False], ["state", "in", ["sale", "done"]],
+        "|", ["name", "ilike", t], ["partner_id", "ilike", t],
+    ]
+    if warehouse_ids:
+        dominio.append(["warehouse_id", "in", warehouse_ids])
+    ovs = await _rpc("sale.order", "search_read",
+        [dominio],
+        {"fields": _CAMPOS_OV, "order": "date_order desc", "limit": limite}
+    )
+    return [_formato_ov(ov) for ov in ovs]
 
 def _detectar_sucursal_raiker(nombre_contacto: str) -> str:
     """Detecta la sucursal Raiker (Boca, Boticaria, Tejeria, etc.) a partir
@@ -366,3 +390,137 @@ async def buscar_productos_venta(termino: str = "", limite: int = 50):
         "nombre":          p.get("name") or "",
         "existencia_odoo": p.get("qty_available", 0),
     } for p in productos if p.get("default_code")]
+
+
+# ── EXISTENCIAS POR UBICACION (solo lectura) ─────────────────
+ETIQUETA_ALMACEN = os.getenv("ALMACEN_ETIQUETA_PRODUCTO", "Maquinaria")  # vacio = todos los productos
+
+def _clave_y_nombre(display: str):
+    m = re.match(r"^\[(.+?)\]\s*(.*)$", display or "")
+    return (m.group(1), m.group(2)) if m else ("", display or "")
+
+async def listar_existencias_ubicaciones(etiqueta: str = None):
+    """Lee stock.quant de ubicaciones internas con codigo de barras. Devuelve
+    [{barcode, clave, nombre, cantidad, reservado}]. No modifica nada en Odoo."""
+    etiqueta = ETIQUETA_ALMACEN if etiqueta is None else etiqueta
+    dominio = [["location_id.usage", "=", "internal"], ["quantity", ">", 0], ["location_id.barcode", "!=", False]]
+    if etiqueta:
+        dominio.append(["product_id.product_tag_ids.name", "=", etiqueta])
+    quants, offset, lote = [], 0, 2000
+    while True:
+        pagina = await _rpc("stock.quant", "search_read", [dominio],
+                            {"fields": ["product_id", "location_id", "quantity", "reserved_quantity"],
+                             "limit": lote, "offset": offset, "order": "id"})
+        quants.extend(pagina)
+        if len(pagina) < lote:
+            break
+        offset += lote
+    loc_ids = sorted({q["location_id"][0] for q in quants if q.get("location_id")})
+    barcodes = {}
+    for i in range(0, len(loc_ids), 500):
+        locs = await _rpc("stock.location", "search_read", [[["id", "in", loc_ids[i:i + 500]]]], {"fields": ["barcode"]})
+        barcodes.update({l["id"]: l.get("barcode") for l in locs})
+    prod_ids = sorted({q["product_id"][0] for q in quants if q.get("product_id")})
+    codigos = {}
+    for i in range(0, len(prod_ids), 500):
+        prods = await _rpc("product.product", "search_read", [[["id", "in", prod_ids[i:i + 500]]]], {"fields": ["default_code", "name"]})
+        codigos.update({p["id"]: (p.get("default_code") or "", p.get("name") or "") for p in prods})
+    salida = []
+    for q in quants:
+        bc = barcodes.get(q["location_id"][0]) if q.get("location_id") else None
+        if not bc:
+            continue
+        clave, nombre = codigos.get(q["product_id"][0], _clave_y_nombre(q["product_id"][1]))
+        salida.append({"barcode": bc, "clave": clave or nombre, "nombre": nombre,
+                       "cantidad": q.get("quantity") or 0, "reservado": q.get("reserved_quantity") or 0})
+    return salida
+
+
+# ── MOVIMIENTOS DE INVENTARIO EN UBICACIONES (solo lectura) ──
+async def movimientos_ubicaciones(codigos, desde: datetime, hasta: datetime):
+    """Movimientos HECHOS (stock.move.line, state=done) entre `desde` y `hasta` (UTC, como Odoo)
+    que tocan alguna de las ubicaciones indicadas (por codigo de barras). Sirve para explicar
+    diferencias de un conteo: salidas por OV, traslados entre ubicaciones, entradas y ajustes.
+    No modifica nada en Odoo. [VERIFICAR] Odoo 17: stock.move.line.quantity (en 16 era qty_done)."""
+    codigos = sorted({c for c in codigos if c})
+    if not codigos:
+        return []
+    f_desde, f_hasta = desde.strftime("%Y-%m-%d %H:%M:%S"), hasta.strftime("%Y-%m-%d %H:%M:%S")
+    # 1) ids de ubicaciones a partir del codigo de barras
+    id_a_cod = {}
+    for i in range(0, len(codigos), 500):
+        locs = await _rpc("stock.location", "search_read", [[["barcode", "in", codigos[i:i + 500]]]], {"fields": ["barcode"]})
+        id_a_cod.update({l["id"]: l.get("barcode") for l in locs})
+    ids = sorted(id_a_cod)
+    # 2) lineas de movimiento hechas en la ventana
+    lineas = {}
+    for i in range(0, len(ids), 400):
+        trozo = ids[i:i + 400]
+        dom = [["state", "=", "done"], ["date", ">=", f_desde], ["date", "<=", f_hasta],
+               "|", ["location_id", "in", trozo], ["location_dest_id", "in", trozo]]
+        pagina, off = [], 0
+        while True:
+            lote = await _rpc("stock.move.line", "search_read", [dom],
+                              {"fields": ["date", "product_id", "location_id", "location_dest_id", "quantity", "picking_id", "reference"],
+                               "limit": 2000, "offset": off, "order": "date"})
+            pagina.extend(lote)
+            if len(lote) < 2000:
+                break
+            off += 2000
+        for l in pagina:
+            lineas[l["id"]] = l
+    lineas = list(lineas.values())
+    if not lineas:
+        return []
+    # 3) nombres/codigos de ubicaciones que no estan en el conteo (origen/destino externo)
+    todos_loc = {l["location_id"][0] for l in lineas if l.get("location_id")} | {l["location_dest_id"][0] for l in lineas if l.get("location_dest_id")}
+    nombres = {}
+    falt = sorted(todos_loc)
+    for i in range(0, len(falt), 500):
+        for l in await _rpc("stock.location", "search_read", [[["id", "in", falt[i:i + 500]]]], {"fields": ["barcode", "complete_name"]}):
+            nombres[l["id"]] = l.get("barcode") or l.get("complete_name") or str(l["id"])
+    # 4) claves de producto
+    prod_ids = sorted({l["product_id"][0] for l in lineas if l.get("product_id")})
+    prods = {}
+    for i in range(0, len(prod_ids), 500):
+        for p in await _rpc("product.product", "search_read", [[["id", "in", prod_ids[i:i + 500]]]], {"fields": ["default_code", "name"]}):
+            prods[p["id"]] = (p.get("default_code") or "", p.get("name") or "")
+    # 5) pickings: tipo, OV y cliente
+    pk_ids = sorted({l["picking_id"][0] for l in lineas if l.get("picking_id")})
+    pickings = {}
+    for i in range(0, len(pk_ids), 500):
+        chunk = [["id", "in", pk_ids[i:i + 500]]]
+        try:
+            rows = await _rpc("stock.picking", "search_read", [chunk],
+                              {"fields": ["name", "origin", "picking_type_code", "sale_id", "partner_id"]})
+        except Exception:
+            rows = await _rpc("stock.picking", "search_read", [chunk],
+                              {"fields": ["name", "origin", "picking_type_code", "partner_id"]})
+        for p in rows:
+            pickings[p["id"]] = p
+    salida = []
+    for l in lineas:
+        pk = pickings.get(l["picking_id"][0]) if l.get("picking_id") else None
+        codigo_tipo = (pk or {}).get("picking_type_code")
+        if codigo_tipo == "outgoing":
+            tipo = "OV"
+        elif codigo_tipo == "internal":
+            tipo = "traslado"
+        elif codigo_tipo == "incoming":
+            tipo = "entrada"
+        else:
+            tipo = "ajuste"       # sin picking: ajuste de inventario o movimiento manual
+        ov = ""
+        if pk:
+            ov = (pk["sale_id"][1] if pk.get("sale_id") else "") or (pk.get("origin") or "")
+        clave, nombre = prods.get(l["product_id"][0], ("", "")) if l.get("product_id") else ("", "")
+        salida.append({
+            "id": l["id"], "fecha": l.get("date"),
+            "producto": clave or nombre, "descripcion": nombre,
+            "cantidad": l.get("quantity") or 0,
+            "origen": nombres.get(l["location_id"][0], "") if l.get("location_id") else "",
+            "destino": nombres.get(l["location_dest_id"][0], "") if l.get("location_dest_id") else "",
+            "tipo": tipo, "picking": pk["name"] if pk else (l.get("reference") or ""), "ov": ov,
+            "cliente": pk["partner_id"][1] if pk and pk.get("partner_id") else "",
+        })
+    return salida
