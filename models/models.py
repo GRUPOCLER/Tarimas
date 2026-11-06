@@ -155,6 +155,7 @@ class SolicitudReimpresion(Base):
     autorizado_por         = Column(String(50), nullable=True)
     fecha_resolucion       = Column(DateTime, nullable=True)
     comentario_resolucion  = Column(Text, nullable=True)
+    datos_json             = Column(Text, nullable=True)  # PACKING_PARCIAL: seleccion de bultos/cantidades
 
 # ── SOLICITUDES DE CAMBIO DE SISTEMA (TAR/CS/MIX) ───────────────
 class SolicitudCambioSistema(Base):

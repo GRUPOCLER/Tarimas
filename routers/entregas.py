@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import io, re, time, uuid
+import io, re, time, uuid, json
 
 from database import get_db
 from models.models import Entrega, Producto, Tarima, DetalleTarima, SistemaEnum, EstatusEntrega, LogAcceso, SolicitudReimpresion, SolicitudCambioSistema, CatalogoItem
@@ -23,7 +23,19 @@ REMITENTE_MAP = {
 REMITENTE_DEFAULT = "GRUPO CLER"
 
 def _remitente(comercializador: str) -> str:
-    return REMITENTE_MAP.get((comercializador or "").strip(), REMITENTE_DEFAULT)
+    """Razon social segun la empresa que genera la entrega. Sin distinguir
+    mayusculas ni espacios ('RAIKER', 'raiker ' y 'Raiker' dan lo mismo).
+    Si la empresa no esta en el mapa, se muestra tal cual en vez de 'GRUPO CLER'."""
+    c = (comercializador or "").strip()
+    if not c:
+        return REMITENTE_DEFAULT
+    mapa = {k.lower(): v for k, v in REMITENTE_MAP.items()}
+    if c.lower() in mapa:
+        return mapa[c.lower()]
+    for k, v in mapa.items():          # ej. 'Raiker Agroindustrias' contiene 'raiker'
+        if k in c.lower():
+            return v
+    return c.upper()
 
 def _barcode_url(data: str, height: int = 50) -> str:
     import urllib.parse
@@ -129,7 +141,7 @@ def _gen_id_tarima(id_entrega: str, idx: int) -> str:
     return f"{id_entrega}-T{idx:03d}"
 
 def _gen_id_detalle(id_tarima: str) -> str:
-    return f"{id_tarima}-D{int(time.time()*1000) % 1000000}"
+    return f"{id_tarima}-D{uuid.uuid4().hex[:8]}"
 
 def _numero_tarima(id_tarima: str) -> int:
     m = re.search(r"-T(\d+)$", id_tarima)
@@ -835,7 +847,9 @@ async def etiquetas_sueltas(
         cm_cant = info_cat.get("cm_cant", 0)
         peso_unit = info_cat.get("peso_unit", 0)
         cm_peso = info_cat.get("cm_peso", 0)
-        cantidad_pend = p.cantidad_pendiente
+        cantidad_pend = int(p.cantidad_pendiente or 0)
+        if cantidad_pend <= 0:
+            continue
         usar_master = clave_norm in skus_master and cm_cant and cm_cant > 0
         if usar_master:
             num_cajas = max(-(-cantidad_pend // cm_cant), 1)  # division hacia arriba, minimo 1
@@ -904,12 +918,9 @@ async def _tarimas_relacionadas(db: AsyncSession, id_entrega: str):
     return list(resultado.values())
 
 # ── LISTA DE EMPAQUE (packing list) ─────────────────────────────
-@router.get("/{id_entrega}/packing")
-async def lista_empaque(
-    id_entrega: str,
-    db:         AsyncSession = Depends(get_db),
-    user:       dict = Depends(get_current_user)
-):
+async def _armar_packing(db: AsyncSession, id_entrega: str, seleccion: Optional[dict] = None) -> dict:
+    """Arma la lista de empaque. Si `seleccion` viene (lista PARCIAL), solo incluye
+    {"tarimas": [id_tarima...], "sueltos": {id_producto: cantidad}}."""
     result = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
     entrega = result.scalar_one_or_none()
     if not entrega:
@@ -932,9 +943,18 @@ async def lista_empaque(
     detalles_r = await db.execute(
         select(DetalleTarima).where(DetalleTarima.id_tarima.in_(tarimas_ids))
     ) if tarimas_ids else None
-    detalles = list(detalles_r.scalars()) if detalles_r else []
+    detalles_todos = list(detalles_r.scalars()) if detalles_r else []
+    detalles_omit = {}
+    for d in detalles_todos:
+        detalles_omit.setdefault(d.id_tarima, []).append(d)
+    detalles = detalles_todos
 
     tarimas_ordenadas = sorted(tarimas, key=lambda x: _numero_tarima(x.id_tarima))
+    # numeracion ORIGINAL de las tarimas (la de sus etiquetas ya impresas)
+    mapa_num_packing = _mapa_numeros_secuenciales(tarimas_ordenadas)
+    if seleccion is not None:
+        sel_t = set(seleccion.get("tarimas") or [])
+        tarimas_ordenadas = [t for t in tarimas_ordenadas if t.id_tarima in sel_t]
     total_tarimas_cerradas = len(tarimas_ordenadas)
 
     # Productos sueltos (sin tarima): en CS son todos; en MIX solo lo pendiente
@@ -945,6 +965,12 @@ async def lista_empaque(
     else:
         sueltos_prods = [p for p in todos_prods
                           if (p.cantidad_pendiente if p.cantidad_pendiente is not None else p.cantidad_total) > 0]
+
+    sueltos_completos = list(sueltos_prods)          # para calcular lo omitido en una parcial
+    cant_sel = {}
+    if seleccion is not None:
+        cant_sel = {k: int(v) for k, v in (seleccion.get("sueltos") or {}).items()}
+        sueltos_prods = [p for p in sueltos_prods if p.id_producto in cant_sel]
 
     # Numeracion combinada: en MIX, tarimas ocupan 1..T y sueltos continuan T+1..T+S
     es_mix = entrega.sistema == "MIX"
@@ -968,8 +994,7 @@ async def lista_empaque(
 
     tarimas_data = []
     peso_mercancia_total = 0.0
-    mapa_num_packing = _mapa_numeros_secuenciales(tarimas_ordenadas)
-    for t in tarimas_ordenadas:
+    for idx_b, t in enumerate(tarimas_ordenadas, 1):
         det = [d for d in detalles if d.id_tarima == t.id_tarima]
         piezas = sum(d.cantidad_asignada for d in det)
         peso_contenido = round(sum(pesos_map.get((d.clave or "").strip().upper(), 0) * d.cantidad_asignada for d in det), 3)
@@ -977,7 +1002,7 @@ async def lista_empaque(
         tarimas_data.append({
             "id_tarima":     t.id_tarima,
             "numero_tarima": mapa_num_packing[t.id_tarima],
-            "numero_bulto":  mapa_num_packing[t.id_tarima],
+            "numero_bulto":  idx_b,
             "total_bultos":  total_bultos,
             "tipo_bulto":    t.tipo_bulto or "tarima",
             "estatus":       t.estatus,
@@ -999,7 +1024,9 @@ async def lista_empaque(
         s = _ser_prod(p)
         s["numero_bulto"] = offset_sueltos + i
         s["total_bultos"] = total_bultos
-        cant_p = s.get("cantidad_pendiente") if entrega.sistema != "CS" else s.get("cantidad_total")
+        cant_p = cant_sel.get(p.id_producto) if seleccion is not None else \
+                 (s.get("cantidad_pendiente") if entrega.sistema != "CS" else s.get("cantidad_total"))
+        s["cantidad_envio"] = cant_p
         peso_p = round(pesos_map.get((p.clave or "").strip().upper(), 0) * (cant_p or 0), 3)
         s["peso_kg"] = peso_p
         peso_mercancia_total += peso_p
@@ -1009,12 +1036,12 @@ async def lista_empaque(
         raise HTTPException(status_code=404, detail="No hay productos ni tarimas cerradas para generar la lista de empaque")
 
     total_piezas_sueltos = sum(
-        (p["cantidad_pendiente"] if entrega.sistema != "CS" else p["cantidad_total"]) for p in sueltos_data
+        (p["cantidad_envio"] or 0) for p in sueltos_data
     )
 
     folio_limpio = re.sub(r"[^A-Z0-9\-]", "", (entrega.num_entrega or id_entrega).upper())
 
-    return {
+    resultado = {
         "entrega":              _serializar_entrega(entrega),
         "es_fusion":            es_fusion,
         "es_mix":               es_mix,
@@ -1030,7 +1057,29 @@ async def lista_empaque(
         "peso_total_kg":        round(sum(t["peso_palet_kg"] for t in tarimas_data) + peso_mercancia_total, 2),
         "barcode_entrega":      folio_limpio,
         "barcode_entrega_url":  _barcode_url(folio_limpio),
+        "es_parcial":           seleccion is not None,
     }
+    if seleccion is not None:
+        # Lo que NO viaja en este envio (queda documentado en la lista)
+        omit_t = [t for t in tarimas_todas if t.estatus == "cerrada" and t.id_tarima not in set(seleccion.get("tarimas") or [])]
+        omitidos = [{"tipo": "tarima", "referencia": t.id_tarima,
+                     "piezas": sum(d.cantidad_asignada for d in detalles_omit.get(t.id_tarima, []))} for t in omit_t]
+        for p in sueltos_completos:
+            tot = p.cantidad_pendiente if (entrega.sistema != "CS" and p.cantidad_pendiente is not None) else p.cantidad_total
+            env = cant_sel.get(p.id_producto, 0)
+            if env < (tot or 0):
+                omitidos.append({"tipo": "suelto", "referencia": p.clave, "descripcion": p.descripcion,
+                                 "solicitado": tot, "enviado": env, "faltante": (tot or 0) - env})
+        resultado["omitidos"] = omitidos
+    return resultado
+
+@router.get("/{id_entrega}/packing")
+async def lista_empaque(
+    id_entrega: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    return await _armar_packing(db, id_entrega)
 
 # ── TODAS LAS ETIQUETAS DE UNA ENTREGA ─────────────────────────
 @router.get("/{id_entrega}/etiquetas")
@@ -1040,7 +1089,7 @@ async def todas_etiquetas(
     user:       dict = Depends(get_current_user)
 ):
     tarimas = await db.execute(select(Tarima).where(Tarima.id_entrega == id_entrega, Tarima.estatus == "cerrada"))
-    ids = [t.id_tarima for t in tarimas.scalars()]
+    ids = sorted((t.id_tarima for t in tarimas.scalars()), key=_numero_tarima)
     if not ids:
         raise HTTPException(status_code=404, detail="Esta entrega no tiene tarimas cerradas")
     resultado = []
@@ -1417,6 +1466,147 @@ async def marcar_impreso_packing(
     entrega.packing_impreso_veces = (entrega.packing_impreso_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": entrega.packing_impreso_veces}
+
+# ── LISTA DE EMPAQUE PARCIAL (requiere autorizacion de un Gerente) ──
+class SueltoParcialIn(BaseModel):
+    id_producto: str
+    cantidad: int
+
+class PackingParcialIn(BaseModel):
+    tarimas: List[str] = []
+    sueltos: List[SueltoParcialIn] = []
+    motivo: str
+
+def _resumen_parcial(sel: dict) -> str:
+    return f"{len(sel.get('tarimas') or [])} bulto(s) agrupado(s), {len(sel.get('sueltos') or {})} linea(s) suelta(s)"
+
+@router.post("/{id_entrega}/packing/parcial/solicitar")
+async def solicitar_packing_parcial(
+    id_entrega: str,
+    body:       PackingParcialIn,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    """Operador: crea una solicitud PENDIENTE que debe aprobar un Gerente/Admin.
+    Gerente/Admin: queda aprobada al momento (con motivo y bitacora)."""
+    if not (body.motivo or "").strip():
+        raise HTTPException(status_code=400, detail="Escribe el motivo por el que la lista sera parcial.")
+    if not body.tarimas and not body.sueltos:
+        raise HTTPException(status_code=400, detail="Selecciona al menos un bulto o producto que si se envia.")
+
+    ent_r = await db.execute(select(Entrega).where(Entrega.id_entrega == id_entrega))
+    entrega = ent_r.scalar_one_or_none()
+    if not entrega:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+
+    # Validar contra la lista completa actual
+    completa = await _armar_packing(db, id_entrega)
+    ids_t = {t["id_tarima"] for t in completa["tarimas"]}
+    disp  = {s["id_producto"]: s["cantidad_envio"] or 0 for s in completa["sueltos"]}
+    for t in body.tarimas:
+        if t not in ids_t:
+            raise HTTPException(status_code=422, detail=f"El bulto {t} no esta cerrado o no pertenece a esta entrega")
+    sel_sueltos = {}
+    for sp in body.sueltos:
+        if sp.id_producto not in disp:
+            raise HTTPException(status_code=422, detail="Un producto seleccionado no pertenece a esta entrega")
+        if sp.cantidad < 1 or sp.cantidad > disp[sp.id_producto]:
+            raise HTTPException(status_code=422, detail=f"Cantidad invalida (1 a {disp[sp.id_producto]}) en un producto")
+        sel_sueltos[sp.id_producto] = sp.cantidad
+    seleccion = {"tarimas": list(dict.fromkeys(body.tarimas)), "sueltos": sel_sueltos}
+    claves_s = {s["id_producto"]: s["clave"] for s in completa["sueltos"]}
+    nums_t = {t["id_tarima"]: t["numero_tarima"] for t in completa["tarimas"]}
+    # Texto legible para que el Gerente vea que autoriza (no afecta el armado)
+    seleccion["resumen"] = {
+        "bultos": [nums_t[t] for t in seleccion["tarimas"]],
+        "sueltos": [{"clave": claves_s[k], "cantidad": v} for k, v in sel_sueltos.items()],
+    }
+    # Parcial = realmente menos que el total; si es todo, que use la lista normal
+    todo = set(seleccion["tarimas"]) == ids_t and all(sel_sueltos.get(k) == v for k, v in disp.items()) and len(sel_sueltos) == len(disp)
+    if todo:
+        raise HTTPException(status_code=422, detail="La seleccion incluye todo el traslado; usa la lista de empaque normal.")
+
+    es_jefe = user.get("rol") in ("admin", "gerente")
+    sol_id = _gen_id_solicitud()
+    ahora = datetime.utcnow()
+    db.add(SolicitudReimpresion(
+        id=sol_id, tipo="PACKING_PARCIAL", id_entrega=id_entrega, referencia=sol_id,
+        num_entrega=entrega.num_entrega, motivo=body.motivo.strip(), solicitado_por=user["sub"],
+        datos_json=json.dumps(seleccion),
+        estatus="aprobada" if es_jefe else "pendiente",
+        autorizado_por=user["sub"] if es_jefe else None,
+        fecha_resolucion=ahora if es_jefe else None,
+    ))
+    db.add(LogAcceso(usuario=user["sub"], accion="SOLICITAR_PACKING_PARCIAL",
+                      detalle=f"{entrega.num_entrega}: {_resumen_parcial(seleccion)} — {body.motivo.strip()}", exito=True))
+    await db.commit()
+    return {"ok": True, "id": sol_id, "estatus": "aprobada" if es_jefe else "pendiente"}
+
+@router.get("/{id_entrega}/packing/parciales")
+async def listar_packing_parciales(
+    id_entrega: str,
+    db:         AsyncSession = Depends(get_db),
+    user:       dict = Depends(get_current_user)
+):
+    q = select(SolicitudReimpresion).where(
+        SolicitudReimpresion.tipo == "PACKING_PARCIAL", SolicitudReimpresion.id_entrega == id_entrega
+    ).order_by(SolicitudReimpresion.fecha_solicitud.desc())
+    if user.get("rol") not in ("admin", "gerente"):
+        q = q.where(SolicitudReimpresion.solicitado_por == user["sub"])
+    r = await db.execute(q)
+    out = []
+    for x in r.scalars():
+        sel = json.loads(x.datos_json) if x.datos_json else {}
+        out.append({"id": x.id, "estatus": x.estatus, "motivo": x.motivo, "solicitado_por": x.solicitado_por,
+                    "autorizado_por": x.autorizado_por, "comentario_resolucion": x.comentario_resolucion,
+                    "fecha_solicitud": str(x.fecha_solicitud or ""), "resumen": _resumen_parcial(sel)})
+    return out
+
+async def _solicitud_parcial(db: AsyncSession, id_entrega: str, id_sol: str, user: dict) -> SolicitudReimpresion:
+    r = await db.execute(select(SolicitudReimpresion).where(
+        SolicitudReimpresion.id == id_sol, SolicitudReimpresion.tipo == "PACKING_PARCIAL",
+        SolicitudReimpresion.id_entrega == id_entrega))
+    x = r.scalar_one_or_none()
+    if not x:
+        raise HTTPException(status_code=404, detail="Lista parcial no encontrada")
+    es_jefe = user.get("rol") in ("admin", "gerente")
+    if not es_jefe and x.solicitado_por != user["sub"]:
+        raise HTTPException(status_code=403, detail="Esta lista parcial la solicito otro usuario")
+    if x.estatus == "pendiente":
+        raise HTTPException(status_code=403, detail="Esta lista parcial aun espera la autorizacion de un Gerente")
+    if x.estatus == "rechazada":
+        raise HTTPException(status_code=403, detail="Esta lista parcial fue rechazada" +
+                            (f": {x.comentario_resolucion}" if x.comentario_resolucion else ""))
+    return x
+
+@router.get("/{id_entrega}/packing/parcial/{id_sol}")
+async def packing_parcial(
+    id_entrega: str, id_sol: str,
+    db:   AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    x = await _solicitud_parcial(db, id_entrega, id_sol, user)
+    datos = await _armar_packing(db, id_entrega, json.loads(x.datos_json or "{}"))
+    datos["parcial"] = {"id": x.id, "motivo": x.motivo, "solicitado_por": x.solicitado_por,
+                        "autorizado_por": x.autorizado_por, "estatus": x.estatus}
+    return datos
+
+@router.post("/{id_entrega}/packing/parcial/{id_sol}/marcar-impreso")
+async def marcar_impreso_packing_parcial(
+    id_entrega: str, id_sol: str,
+    db:   AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    """La autorizacion cubre UNA impresion. Un Gerente/Admin puede reimprimir (queda en bitacora)."""
+    x = await _solicitud_parcial(db, id_entrega, id_sol, user)
+    es_jefe = user.get("rol") in ("admin", "gerente")
+    if x.estatus == "usada" and not es_jefe:
+        raise HTTPException(status_code=403, detail="Esta lista parcial ya se imprimio. Solicita una nueva si hace falta.")
+    if x.estatus == "usada":
+        db.add(LogAcceso(usuario=user["sub"], accion="REIMPRESION_PACKING_PARCIAL", detalle=id_sol, exito=True))
+    x.estatus = "usada"
+    await db.commit()
+    return {"ok": True}
 
 # ── SERIALIZERS ───────────────────────────────────────────────
 def _serializar_entrega(e: Entrega) -> dict:

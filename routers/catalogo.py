@@ -53,13 +53,58 @@ def _normalizar_col(nombre: str) -> str:
     return _ALIAS.get(n, n.replace(" ", "_"))
 
 def _num(v, es_entero=False):
+    """Convierte a numero sin confundir separadores. Los valores ya numericos
+    (float/int) pasan tal cual. En texto: '1,250.5' -> 1250.5, '0,205' -> 0.205
+    (coma decimal), '1,250' -> 1250 (coma de miles), '12.5 kg' -> 12.5."""
     if v is None or v == "":
         return 0
-    try:
-        n = float(str(v).replace(",", "").strip())
-        return int(round(n)) if es_entero else n
-    except (ValueError, TypeError):
+    if isinstance(v, bool):
         return 0
+    if isinstance(v, (int, float)):
+        n = float(v)
+    else:
+        t = re.sub(r"[^\d,.\-]", "", str(v))
+        if not t or t in "-.,":
+            return 0
+        if "," in t and "." in t:
+            if t.rfind(",") > t.rfind("."):          # 1.250,5 -> coma decimal
+                t = t.replace(".", "").replace(",", ".")
+            else:                                     # 1,250.5 -> coma de miles
+                t = t.replace(",", "")
+        elif "," in t:
+            entero, _, dec = t.rpartition(",")
+            if t.count(",") == 1 and (len(dec) != 3 or entero.lstrip("-") == "0"):
+                t = entero + "." + dec                # 0,205 / 12,5 -> decimal
+            else:
+                t = t.replace(",", "")                # 1,250 / 1,250,000 -> miles
+        try:
+            n = float(t)
+        except ValueError:
+            return 0
+    return int(round(n)) if es_entero else n
+
+def _filas_desde_gviz_json(texto: str) -> list:
+    """Parsea la respuesta de gviz (out:json) a dicts con encabezados normalizados.
+    Usa el valor crudo 'v'; si viene null usa el texto formateado 'f'."""
+    import json
+    try:
+        ini, fin = texto.index("("), texto.rindex(")")
+        tabla = json.loads(texto[ini + 1:fin])["table"]
+    except Exception:
+        return []
+    etiquetas = [(c.get("label") or c.get("id") or "") for c in tabla.get("cols", [])]
+    if not any(etiquetas) or not any(_normalizar_col(e) == "sku" for e in etiquetas):
+        return []   # gviz no detecto encabezados -> usar CSV
+    enc = [_normalizar_col(e) for e in etiquetas]
+    filas = []
+    for row in tabla.get("rows", []):
+        celdas = row.get("c") or []
+        vals = []
+        for c in celdas:
+            vals.append(None if c is None else (c.get("v") if c.get("v") is not None else c.get("f")))
+        vals += [None] * (len(enc) - len(vals))
+        filas.append(dict(zip(enc, vals)))
+    return filas
 
 async def _upsert_catalogo(db: AsyncSession, filas: list) -> dict:
     """Recibe una lista de dicts ya normalizados (claves como 'sku', 'cm_cant', etc.)
@@ -119,6 +164,27 @@ async def listar_catalogo(
         "cm_cant": i.cm_cant, "cm_peso": i.cm_peso, "cm_lr": i.cm_lr, "cm_an": i.cm_an, "cm_al": i.cm_al,
         "sat_codigo": i.sat_codigo,
     } for i in items]
+
+@router.get("/diagnostico-pesos")
+async def diagnostico_pesos(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Lista SKUs con pesos sospechosos (posible error kg vs toneladas/gramos):
+    peso de caja master incoherente con peso_unit x piezas por caja (ratio ~1000)
+    o pesos unitarios fuera de lo razonable (>500 kg por pieza)."""
+    res = await db.execute(select(CatalogoItem).order_by(CatalogoItem.sku))
+    sospechosos = []
+    for i in res.scalars():
+        motivo = None
+        if i.peso_unit and i.peso_unit > 500:
+            motivo = "peso_unit > 500 kg por pieza"
+        elif i.cm_cant and i.cm_cant > 0 and i.peso_unit and i.cm_peso:
+            esperado = i.peso_unit * i.cm_cant
+            ratio = i.cm_peso / esperado if esperado else 0
+            if ratio and not (0.5 <= ratio <= 2):
+                motivo = f"cm_peso / (peso_unit x cm_cant) = {ratio:.3g}"
+        if motivo:
+            sospechosos.append({"sku": i.sku, "peso_unit": i.peso_unit, "cm_cant": i.cm_cant,
+                                "cm_peso": i.cm_peso, "motivo": motivo})
+    return {"total_sospechosos": len(sospechosos), "items": sospechosos}
 
 @router.get("/contar")
 async def contar_catalogo(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
@@ -186,13 +252,13 @@ async def sincronizar_desde_drive(db: AsyncSession = Depends(get_db), user: dict
     if not GOOGLE_SHEET_CATALOGO_ID:
         raise HTTPException(status_code=500, detail="GOOGLE_SHEET_CATALOGO_ID no esta configurado en Railway")
 
-    url = (
-        f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CATALOGO_ID}/gviz/tq"
-        f"?tqx=out:csv&sheet={quote(GOOGLE_SHEET_CATALOGO_HOJA)}"
-    )
+    base = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_CATALOGO_ID}/gviz/tq"
+    hoja = quote(GOOGLE_SHEET_CATALOGO_HOJA)
     async with httpx.AsyncClient(timeout=30) as client:
         try:
-            r = await client.get(url, follow_redirects=True)
+            # JSON primero: trae el valor numerico REAL de cada celda ("v"), no el
+            # texto formateado de la hoja (que puede traer comas/puntos de otra region).
+            r = await client.get(f"{base}?tqx=out:json&headers=1&sheet={hoja}", follow_redirects=True)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"No se pudo conectar a Google Sheets: {e}")
 
@@ -206,21 +272,22 @@ async def sincronizar_desde_drive(db: AsyncSession = Depends(get_db), user: dict
     if "<html" in r.text[:200].lower():
         raise HTTPException(
             status_code=502,
-            detail="Google regreso una pagina de login en vez del CSV — la hoja dejo de ser publica, "
+            detail="Google regreso una pagina de login en vez de los datos — la hoja dejo de ser publica, "
                    "revisa el permiso de 'Compartir'"
         )
 
-    texto = r.content.decode("utf-8-sig", errors="ignore")
-    lector = csv.reader(io.StringIO(texto))
-    filas_raw = list(lector)
-    if not filas_raw:
-        raise HTTPException(status_code=422, detail=f"La pestana '{GOOGLE_SHEET_CATALOGO_HOJA}' esta vacia")
-
-    encabezado = [_normalizar_col(c) for c in filas_raw[0]]
-    filas = [dict(zip(encabezado, f)) for f in filas_raw[1:]]
+    filas, fuente = _filas_desde_gviz_json(r.text), "google_sheets_json"
+    if not filas:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r2 = await client.get(f"{base}?tqx=out:csv&sheet={hoja}", follow_redirects=True)
+        filas_raw = list(csv.reader(io.StringIO(r2.content.decode("utf-8-sig", errors="ignore"))))
+        if not filas_raw:
+            raise HTTPException(status_code=422, detail=f"La pestana '{GOOGLE_SHEET_CATALOGO_HOJA}' esta vacia")
+        encabezado = [_normalizar_col(c) for c in filas_raw[0]]
+        filas, fuente = [dict(zip(encabezado, f)) for f in filas_raw[1:]], "google_sheets_csv"
 
     resultado = await _upsert_catalogo(db, filas)
     resultado["ok"] = True
-    resultado["fuente"] = "google_sheets"
+    resultado["fuente"] = fuente
     resultado["hoja_usada"] = GOOGLE_SHEET_CATALOGO_HOJA
     return resultado

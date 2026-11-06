@@ -22,7 +22,7 @@ RE_ORIGEN  = re.compile(r'De almac[eé]n\s+([A-Z0-9\-]+)', re.I)
 RE_COMENT  = re.compile(r'Comentarios\s+(.+?)(?:\n|$)')
 RE_FILA    = re.compile(
     r'^(\d+)\s+([A-Z0-9\-]+)\s+(.*?)\s*([A-Z][A-Z0-9\-]{1,14})\s*'
-    r'(PZA|PZAS|PZ|KG|LTS?|UND|CAJA)\s+([\d,]+(?:\.\d+)?)\s*MXP\s+([\d,]+\.\d+)\s+([\d,]+(?:\.\d+)?)\s*$'
+    r'(PZA|PZAS|PZ|KG|LTS?|UND|CAJA)\s+([\d,]+(?:\.\d+)?)\s*(?:MXP\s+([\d,]+\.\d+)\s+([\d,]+(?:\.\d+)?)|\*+(?:\s+[\d,]+(?:\.\d+)?)?)?\s*$'
 )
 
 STOP_LINEA = ('REPRESENTANTE', 'COMENTARIOS', 'PÁGINA', 'PAGINA', 'DE ALMACÉN', 'DE ALMACEN',

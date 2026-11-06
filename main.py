@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
             "DEFAULT (now() AT TIME ZONE 'America/Mexico_City')"
         ))
         await conn.execute(text(
+            "ALTER TABLE solicitudes_reimpresion ADD COLUMN IF NOT EXISTS datos_json TEXT"
+        ))
+        await conn.execute(text(
             "ALTER TABLE solicitudes_reimpresion ADD COLUMN IF NOT EXISTS fecha_solicitud_local TIMESTAMP "
             "DEFAULT (now() AT TIME ZONE 'America/Mexico_City')"
         ))

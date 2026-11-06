@@ -156,6 +156,7 @@ def _ser(s: SolicitudReimpresion) -> dict:
         "autorizado_por":         s.autorizado_por,
         "fecha_resolucion":       str(s.fecha_resolucion or ""),
         "comentario_resolucion":  s.comentario_resolucion,
+        "datos_json":             s.datos_json,
     }
 
 # ── CAMBIOS DE SISTEMA (TAR/CS/MIX) ─────────────────────────────
