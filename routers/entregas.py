@@ -22,6 +22,16 @@ REMITENTE_MAP = {
 }
 REMITENTE_DEFAULT = "GRUPO CLER"
 
+_RE_EXT = re.compile(r"\s*\(EXT\d+\)\s*$", re.I)
+
+def _sku_base(clave: str) -> str:
+    """'RKD52 (EXT1)' -> 'RKD52'. Las extensiones se cruzan con el catalogo por su SKU base
+    (asi heredan las piezas por caja master)."""
+    return _RE_EXT.sub("", (clave or "").strip()).upper()
+
+def _es_ext(clave: str) -> bool:
+    return bool(_RE_EXT.search(clave or ""))
+
 def _remitente(comercializador: str) -> str:
     """Razon social segun la empresa que genera la entrega. Sin distinguir
     mayusculas ni espacios ('RAIKER', 'raiker ' y 'Raiker' dan lo mismo).
@@ -347,7 +357,7 @@ async def detalle_entrega(
 
     # Cruzar con el catalogo para saber cuales productos PUEDEN ir en caja
     # master — el operador decide despues si los usa asi o no al imprimir.
-    claves = list(set((p.clave or "").strip().upper() for p in productos if p.clave))
+    claves = list(set(_sku_base(p.clave) for p in productos if p.clave))
     catalogo_map = {}
     if claves:
         cat_r = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(claves)))
@@ -357,9 +367,9 @@ async def detalle_entrega(
     productos_ser = []
     for p in productos:
         s = _ser_prod(p)
-        info_cat = catalogo_map.get((p.clave or "").strip().upper(), {})
-        s["cm_cant"] = info_cat.get("cm_cant", 0)
-        s["peso_unit"] = info_cat.get("peso_unit", 0)
+        info_cat = catalogo_map.get(_sku_base(p.clave), {})
+        s["cm_cant"] = info_cat.get("cm_cant", 0)   # las extensiones heredan las piezas por caja master del SKU base
+        s["peso_unit"] = 0 if _es_ext(p.clave) else info_cat.get("peso_unit", 0)
         productos_ser.append(s)
 
     data["productos"] = productos_ser
@@ -829,7 +839,7 @@ async def etiquetas_sueltas(
         offset = tars_r.scalar() or 0
 
     # Cruzar con el catalogo para saber cuantas piezas trae cada caja master y sus pesos
-    claves = list(set((p.clave or "").strip().upper() for p in productos if p.clave))
+    claves = list(set(_sku_base(p.clave) for p in productos if p.clave))
     catalogo_map = {}
     if claves:
         cat_r = await db.execute(select(CatalogoItem).where(CatalogoItem.sku.in_(claves)))
@@ -843,14 +853,19 @@ async def etiquetas_sueltas(
     bultos = []
     for p in productos:
         clave_norm = (p.clave or "").strip().upper()
-        info_cat = catalogo_map.get(clave_norm, {})
+        es_ext = _es_ext(p.clave)
+        info_cat = catalogo_map.get(_sku_base(p.clave), {})
         cm_cant = info_cat.get("cm_cant", 0)
-        peso_unit = info_cat.get("peso_unit", 0)
-        cm_peso = info_cat.get("cm_peso", 0)
+        # El peso del catalogo es del producto, no del empaque extra: en extensiones queda en 0
+        peso_unit = 0 if es_ext else info_cat.get("peso_unit", 0)
+        cm_peso = 0 if es_ext else info_cat.get("cm_peso", 0)
         cantidad_pend = int(p.cantidad_pendiente or 0)
         if cantidad_pend <= 0:
             continue
-        usar_master = clave_norm in skus_master and cm_cant and cm_cant > 0
+        # Una extension va en caja master si se marco ella o si se marco su SKU base:
+        # 16 pzas de extension a 4 por caja = 4 cajas master de extension (no 16 etiquetas)
+        marcado = clave_norm in skus_master or (es_ext and _sku_base(p.clave) in skus_master)
+        usar_master = marcado and cm_cant and cm_cant > 0
         if usar_master:
             num_cajas = max(-(-cantidad_pend // cm_cant), 1)  # division hacia arriba, minimo 1
             restante = cantidad_pend
