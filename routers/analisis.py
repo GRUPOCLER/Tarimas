@@ -155,6 +155,20 @@ async def resumen(
     por_fuente = corte(lambda e: e.fuente)
     top_clientes = corte(lambda e: (e.nombre_cliente or "").strip())[:8]
 
+    # Flujo empresa -> sistema -> cliente (para el diagrama de Sankey)
+    fl = {}
+    for e in ents:
+        kf = ((e.comercializador or "").strip().title() or "Sin dato", e.sistema or "Sin dato", (e.nombre_cliente or "").strip() or "Sin dato")
+        f = fl.setdefault(kf, {"empresa": kf[0], "sistema": kf[1], "cliente": kf[2], "entregas": 0, "piezas": 0, "bultos": 0, "kg": 0.0})
+        f["entregas"] += 1
+        ps = prods_por_ent.get(e.id_entrega, [])
+        f["piezas"] += sum(p.cantidad_total or 0 for p in ps)
+        f["kg"] += sum(_kg_prod(p, pesos) for p in ps)
+        ts = [t for t in tars_por_ent.get(e.id_entrega, []) if t.estatus == "cerrada"]
+        f["bultos"] += len(ts); f["kg"] += sum(t.peso_palet_kg or 0 for t in ts)
+    flujo = sorted(fl.values(), key=lambda r: -r["piezas"])
+    for r in flujo: r["kg"] = round(r["kg"], 1)
+
     sk = {}
     for p in prods:
         b = _base(p.clave)
@@ -245,7 +259,7 @@ async def resumen(
             "filtros": {"empresa": empresa, "sistema": sistema},
             "kpis": k, "serie_diaria": list(ser.values()),
             "por_empresa": por_empresa, "por_sistema": por_sistema, "por_fuente": por_fuente,
-            "top_clientes": top_clientes, "top_skus": top_skus, "ciclo": ciclo, "pendientes": pendientes,
+            "top_clientes": top_clientes, "flujo": flujo, "top_skus": top_skus, "ciclo": ciclo, "pendientes": pendientes,
             "heatmap": heatmap, "usuarios": usuarios, "calidad": calidad,
             "empresas_disponibles": sorted({(e.comercializador or "").title() for e in ents if e.comercializador})}
 
