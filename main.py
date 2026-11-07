@@ -7,7 +7,7 @@ from sqlalchemy import text
 load_dotenv()
 
 from database import engine, Base
-from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin, reimpresiones
+from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin, reimpresiones, analisis
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -44,6 +44,30 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE log_accesos ADD COLUMN IF NOT EXISTS fecha_local TIMESTAMP "
             "DEFAULT (now() AT TIME ZONE 'America/Mexico_City')"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ultima_impresion_en TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tarimas ADD COLUMN IF NOT EXISTS ultima_impresion_por VARCHAR(50)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS sueltas_primera_en TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS sueltas_ultima_en TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS sueltas_ultima_por VARCHAR(50)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS packing_primera_en TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS packing_ultima_en TIMESTAMP"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE entregas ADD COLUMN IF NOT EXISTS packing_ultima_por VARCHAR(50)"
         ))
         await conn.execute(text(
             "ALTER TABLE solicitudes_reimpresion ADD COLUMN IF NOT EXISTS datos_json TEXT"
@@ -131,6 +155,7 @@ app.include_router(setup.router,     prefix="/api/setup",     tags=["setup"])
 app.include_router(odoo.router,      prefix="/api/odoo",      tags=["odoo"])
 app.include_router(admin.router,     prefix="/api/admin",     tags=["admin"])
 app.include_router(reimpresiones.router, prefix="/api/reimpresiones", tags=["reimpresiones"])
+app.include_router(analisis.router, prefix="/api/analisis", tags=["analisis"])
 
 @app.get("/")
 def root():

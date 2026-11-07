@@ -52,6 +52,13 @@ class Entrega(Base):
     creado_por     = Column(String(50))
     etiquetas_sueltas_impresas_veces = Column(Integer, default=0)
     packing_impreso_veces            = Column(Integer, default=0)
+    # Fechas de impresion (UTC) de etiquetas sueltas y lista de empaque
+    sueltas_primera_en  = Column(DateTime, nullable=True)
+    sueltas_ultima_en   = Column(DateTime, nullable=True)
+    sueltas_ultima_por  = Column(String(50), nullable=True)
+    packing_primera_en  = Column(DateTime, nullable=True)
+    packing_ultima_en   = Column(DateTime, nullable=True)
+    packing_ultima_por  = Column(String(50), nullable=True)
     # Relaciones
     productos      = relationship("Producto", back_populates="entrega", cascade="all,delete")
     tarimas        = relationship("Tarima",   back_populates="entrega", cascade="all,delete")
@@ -90,6 +97,8 @@ class Tarima(Base):
     impresa_veces        = Column(Integer, default=0)
     primera_impresion_en = Column(DateTime, nullable=True)
     primera_impresion_por= Column(String(50), nullable=True)
+    ultima_impresion_en  = Column(DateTime, nullable=True)
+    ultima_impresion_por = Column(String(50), nullable=True)
     # Relaciones
     entrega        = relationship("Entrega", back_populates="tarimas")
     detalles       = relationship("DetalleTarima", back_populates="tarima", cascade="all,delete")

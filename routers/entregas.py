@@ -32,6 +32,10 @@ def _sku_base(clave: str) -> str:
 def _es_ext(clave: str) -> bool:
     return bool(_RE_EXT.search(clave or ""))
 
+def _iso(dt) -> Optional[str]:
+    """Fecha UTC de la BD -> ISO con Z (el frontend la convierte a hora de Mexico)."""
+    return (dt.isoformat() + "Z") if dt else None
+
 def _remitente(comercializador: str) -> str:
     """Razon social segun la empresa que genera la entrega. Sin distinguir
     mayusculas ni espacios ('RAIKER', 'raiker ' y 'Raiker' dan lo mismo).
@@ -766,6 +770,9 @@ async def etiqueta_tarima(
         "fecha_entrega":   entrega.fecha_entrega,
         "estatus":         tarima.estatus,
         "impresa_veces":   tarima.impresa_veces or 0,
+        "primera_impresion_en":  _iso(tarima.primera_impresion_en),
+        "ultima_impresion_en":   _iso(tarima.ultima_impresion_en),
+        "ultima_impresion_por":  tarima.ultima_impresion_por,
         "productos":       productos,
         "total_piezas":    total_piezas,
         "peso_palet_kg":   peso_palet,
@@ -918,6 +925,9 @@ async def etiquetas_sueltas(
             "barcode_entrega":     barcode_entrega,
             "barcode_entrega_url": barcode_url,
             "impresa_veces":       entrega.etiquetas_sueltas_impresas_veces or 0,
+            "primera_impresion_en": _iso(entrega.sueltas_primera_en),
+            "ultima_impresion_en":  _iso(entrega.sueltas_ultima_en),
+            "ultima_impresion_por": entrega.sueltas_ultima_por,
         })
     return resultado
 
@@ -1410,9 +1420,12 @@ async def marcar_impresa_tarima(
     entrega = ent_r.scalar_one_or_none()
     await _controlar_impresion(db, user, tarima.impresa_veces or 0, body.motivo, "TARIMA", id_tarima,
                                 id_entrega, entrega.num_entrega if entrega else "")
+    ahora = datetime.utcnow()
     if not tarima.impresa_veces:
-        tarima.primera_impresion_en  = datetime.utcnow()
+        tarima.primera_impresion_en  = ahora
         tarima.primera_impresion_por = user["sub"]
+    tarima.ultima_impresion_en  = ahora
+    tarima.ultima_impresion_por = user["sub"]
     tarima.impresa_veces = (tarima.impresa_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": tarima.impresa_veces}
@@ -1440,10 +1453,13 @@ async def marcar_impresa_lote(
     previas = max((t.impresa_veces or 0) for t in tarimas)
     await _controlar_impresion(db, user, previas, body.motivo, "TARIMA", f"LOTE-{id_entrega}",
                                 id_entrega, entrega.num_entrega if entrega else "")
+    ahora = datetime.utcnow()
     for t in tarimas:
         if not t.impresa_veces:
-            t.primera_impresion_en  = datetime.utcnow()
+            t.primera_impresion_en  = ahora
             t.primera_impresion_por = user["sub"]
+        t.ultima_impresion_en  = ahora
+        t.ultima_impresion_por = user["sub"]
         t.impresa_veces = (t.impresa_veces or 0) + 1
     await db.commit()
     return {"ok": True, "tarimas": len(tarimas)}
@@ -1461,6 +1477,11 @@ async def marcar_impresa_sueltas(
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
     await _controlar_impresion(db, user, entrega.etiquetas_sueltas_impresas_veces or 0, body.motivo,
                                 "SUELTAS", id_entrega, id_entrega, entrega.num_entrega)
+    ahora = datetime.utcnow()
+    if not entrega.etiquetas_sueltas_impresas_veces:
+        entrega.sueltas_primera_en = ahora
+    entrega.sueltas_ultima_en  = ahora
+    entrega.sueltas_ultima_por = user["sub"]
     entrega.etiquetas_sueltas_impresas_veces = (entrega.etiquetas_sueltas_impresas_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": entrega.etiquetas_sueltas_impresas_veces}
@@ -1478,6 +1499,11 @@ async def marcar_impreso_packing(
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
     await _controlar_impresion(db, user, entrega.packing_impreso_veces or 0, body.motivo,
                                 "PACKING", id_entrega, id_entrega, entrega.num_entrega)
+    ahora = datetime.utcnow()
+    if not entrega.packing_impreso_veces:
+        entrega.packing_primera_en = ahora
+    entrega.packing_ultima_en  = ahora
+    entrega.packing_ultima_por = user["sub"]
     entrega.packing_impreso_veces = (entrega.packing_impreso_veces or 0) + 1
     await db.commit()
     return {"ok": True, "veces": entrega.packing_impreso_veces}
@@ -1603,7 +1629,8 @@ async def packing_parcial(
     x = await _solicitud_parcial(db, id_entrega, id_sol, user)
     datos = await _armar_packing(db, id_entrega, json.loads(x.datos_json or "{}"))
     datos["parcial"] = {"id": x.id, "motivo": x.motivo, "solicitado_por": x.solicitado_por,
-                        "autorizado_por": x.autorizado_por, "estatus": x.estatus}
+                        "autorizado_por": x.autorizado_por, "estatus": x.estatus,
+                        "impresiones": json.loads(x.datos_json or "{}").get("impresiones", [])}
     return datos
 
 @router.post("/{id_entrega}/packing/parcial/{id_sol}/marcar-impreso")
@@ -1620,6 +1647,10 @@ async def marcar_impreso_packing_parcial(
     if x.estatus == "usada":
         db.add(LogAcceso(usuario=user["sub"], accion="REIMPRESION_PACKING_PARCIAL", detalle=id_sol, exito=True))
     x.estatus = "usada"
+    # Historial de impresiones de esta lista parcial (para el sello de la hoja)
+    sel = json.loads(x.datos_json or "{}")
+    sel.setdefault("impresiones", []).append({"en": _iso(datetime.utcnow()), "por": user["sub"]})
+    x.datos_json = json.dumps(sel)
     await db.commit()
     return {"ok": True}
 
@@ -1640,6 +1671,9 @@ def _serializar_entrega(e: Entrega) -> dict:
         "fuente":         e.fuente,
         "etiquetas_sueltas_impresas_veces": e.etiquetas_sueltas_impresas_veces or 0,
         "packing_impreso_veces":            e.packing_impreso_veces or 0,
+        "packing_primera_en":               _iso(e.packing_primera_en),
+        "packing_ultima_en":                _iso(e.packing_ultima_en),
+        "packing_ultima_por":               e.packing_ultima_por,
     }
 
 def _ser_prod(p: Producto) -> dict:
