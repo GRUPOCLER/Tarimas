@@ -183,6 +183,17 @@ async def diag_env(user: dict = Depends(get_current_user)):
         "ODOO_DB_desde_modulo": repr(odoo_svc.ODOO_DB),
     }
 
+@router.get("/diag/compatibilidad")
+async def diag_compatibilidad(user: dict = Depends(get_current_user)):
+    """Revisa contra el Odoo conectado (ej. tras pasar de 17 a 19) que existan
+    todos los modelos y campos que usa Tarimas y que las consultas respondan."""
+    if user.get("rol") not in ("admin", "gerente"):
+        raise HTTPException(status_code=403, detail="Requiere admin o gerente")
+    try:
+        return await odoo_svc.verificar_compatibilidad()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
 @router.get("/diag/buscar-partner")
 async def diag_buscar_partner(nombre: str, user: dict = Depends(get_current_user)):
     """Busca partners por nombre en la base de Odoo conectada ahora mismo.
