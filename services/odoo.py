@@ -398,6 +398,43 @@ async def buscar_productos_venta(termino: str = "", limite: int = 50):
     } for p in productos if p.get("default_code")]
 
 
+# ── VALIDAR UN PDF CONTRA ODOO ───────────────────────────────────────────────
+async def productos_de_folio(folio: str):
+    """Busca la entrega por su folio (ej. ALM-PT/OUT/00791) y devuelve los datos tal
+    como los tiene Odoo, o None si no existe o Odoo no esta configurado."""
+    if not ODOO_URL or not folio:
+        return None
+    ids = await _rpc("stock.picking", "search", [[["name", "=", folio.strip()]]], {"limit": 1})
+    if not ids:
+        return None
+    return await cargar_entrega(ids)
+
+
+async def productos_de_orden(nombre_ov: str):
+    """Partidas de la orden de venta (ej. S122781) tal como estan en Odoo, o None.
+    Se usa cuando el PDF que se sube es la ORDEN DE VENTA y no la entrega."""
+    if not ODOO_URL or not nombre_ov:
+        return None
+    lineas = await _rpc("sale.order.line", "search_read",
+        [[["order_id.name", "=", nombre_ov.strip()], ["display_type", "=", False]]],
+        {"fields": ["product_id", "product_uom_qty"]})
+    if not lineas:
+        return None
+    acum = {}
+    for l in lineas:
+        if not l.get("product_id") or (l.get("product_uom_qty") or 0) <= 0:
+            continue
+        nombre = l["product_id"][1]
+        m = re.match(r"^\[([^\]]+)\]", nombre)
+        clave = m.group(1).strip() if m else nombre.split(" ")[0]
+        desc = nombre.replace(m.group(0), "").strip() if m else nombre
+        if clave in acum:
+            acum[clave]["cantidad_total"] += round(l["product_uom_qty"])
+        else:
+            acum[clave] = {"clave": clave, "descripcion": desc, "cantidad_total": round(l["product_uom_qty"]), "unidad": "PZA"}
+    return {"productos": list(acum.values())} if acum else None
+
+
 # ── DIAGNOSTICO DE COMPATIBILIDAD (para cambios de version de Odoo) ──────────
 # Todos los modelos y campos que usa Tarimas. Si Odoo cambia de version, el
 # diagnostico dice exactamente que falta, sin tener que probar pantalla por pantalla.
@@ -410,10 +447,13 @@ CAMPOS_USADOS = {
     "stock.warehouse": ["name", "code", "view_location_id", "lot_stock_id"],
     "stock.location":  ["usage"],
     "product.product": ["default_code", "name", "qty_available", "sale_ok", "product_tag_ids"],
+    "sale.order.line": ["order_id", "product_id", "product_uom_qty", "display_type"],
 }
 
 async def verificar_compatibilidad():
-    reporte = {"servidor": None, "autenticacion": None, "modelos": [], "faltantes_en_uso": {}, "ok": True}
+    reporte = {"servidor": None, "autenticacion": None, "modelos": [], "faltantes_en_uso": {}, "ok": True,
+               "alertas": [] if os.getenv("JWT_SECRET") else
+               ["JWT_SECRET no esta definida en Railway: las sesiones usan una clave por defecto que esta en el codigo. Definela con un valor largo y aleatorio."]}
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.post(ODOO_URL + "/jsonrpc", json={"jsonrpc": "2.0", "method": "call",

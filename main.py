@@ -128,6 +128,9 @@ async def lifespan(app: FastAPI):
             print(f"[migracion] OK: {stmt}")
         except Exception as e:
             print(f"[migracion] omitida ({stmt}): {type(e).__name__}: {e}")
+    import os as _os
+    if not _os.getenv("JWT_SECRET"):
+        print("[SEGURIDAD] JWT_SECRET no esta definida: se usa la clave por defecto del codigo. Definela en Railway.")
     yield
 
 app = FastAPI(

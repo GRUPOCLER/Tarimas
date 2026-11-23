@@ -176,6 +176,8 @@ async def quitar_almacen(id_almacen: int, db: AsyncSession = Depends(get_db), us
 @router.get("/diag/env")
 async def diag_env(user: dict = Depends(get_current_user)):
     """Muestra el valor RAW que el proceso ve ahora mismo para ODOO_DB."""
+    if user.get("rol") not in ("admin", "gerente"):
+        raise HTTPException(status_code=403, detail="Requiere admin o gerente")
     valor = os.getenv("ODOO_DB", "NO_DEFINIDA")
     return {
         "ODOO_DB_raw": repr(valor),
