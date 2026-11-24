@@ -36,35 +36,6 @@ def _partner_map():
 PARTNER_MAP = _partner_map()
 
 async def _rpc(model: str, method: str, args: list, kwargs: dict = None):
-    # Proteccion ante cambios de version de Odoo (17 -> 19): si se pide un campo
-    # que ya no existe en el modelo, Odoo rechaza TODA la consulta. Aqui se quitan
-    # los campos inexistentes antes de consultar (y se registran en _CAMPOS_FALTANTES
-    # para verlos en /api/odoo/diag/compatibilidad).
-    if method == "search_read" and kwargs and kwargs.get("fields"):
-        validos = await _campos_modelo(model)
-        if validos:
-            pedidos = kwargs["fields"]
-            faltan = [f for f in pedidos if f not in validos and f != "id"]
-            if faltan:
-                _CAMPOS_FALTANTES.setdefault(model, set()).update(faltan)
-                kwargs = dict(kwargs, fields=[f for f in pedidos if f not in faltan])
-    return await _rpc_directo(model, method, args, kwargs)
-
-_CAMPOS_CACHE = {}
-_CAMPOS_FALTANTES = {}
-
-async def _campos_modelo(model: str) -> set:
-    """Nombres de campos del modelo en la base conectada (cache por proceso)."""
-    if model in _CAMPOS_CACHE:
-        return _CAMPOS_CACHE[model]
-    try:
-        info = await _rpc_directo(model, "fields_get", [], {"attributes": ["type"]})
-        _CAMPOS_CACHE[model] = set(info.keys())
-    except Exception:
-        return set()  # si no se puede consultar, no se filtra (comportamiento anterior)
-    return _CAMPOS_CACHE[model]
-
-async def _rpc_directo(model: str, method: str, args: list, kwargs: dict = None):
     if not ODOO_URL:
         raise Exception(
             "ODOO_URL no esta configurada en las variables de Railway. "
@@ -107,8 +78,7 @@ async def _uid(client: httpx.AsyncClient):
 
 async def listar_ovs_pendientes(warehouse_ids: list = None):
     fecha_limite = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
-    # Desde Odoo 17 la OV confirmada siempre es state='sale' (el antiguo 'done' ahora es locked=True)
-    dominio = [["picking_ids", "!=", False], ["state", "=", "sale"], ["date_order", ">=", fecha_limite]]
+    dominio = [["picking_ids", "!=", False], ["state", "in", ["sale", "done"]], ["date_order", ">=", fecha_limite]]
     if warehouse_ids:
         dominio.append(["warehouse_id", "in", warehouse_ids])
     ovs = await _rpc("sale.order", "search_read",
@@ -155,7 +125,7 @@ async def cargar_entrega(picking_ids: list):
     validada = p.get("state") == "done"
     moves = await _rpc("stock.move", "search_read",
         [[["id", "in", p["move_ids"]]]],
-        {"fields": ["product_id", "product_uom_qty", "quantity", "reference", "description_picking"]}
+        {"fields": ["product_id", "product_uom_qty", "quantity", "name"]}
     )
     productos = []
     for m in moves:
@@ -168,7 +138,7 @@ async def cargar_entrega(picking_ids: list):
         cantidad = m.get("quantity", 0) if validada else m.get("product_uom_qty", 0)
         if cantidad <= 0:
             continue
-        nombre = m["product_id"][1] if m.get("product_id") else (m.get("description_picking") or m.get("reference") or "")
+        nombre = m["product_id"][1] if m.get("product_id") else m["name"]
         match = re.match(r"^\[([^\]]+)\]", nombre)
         clave = match.group(1).strip() if match else nombre.split(" ")[0]
         desc  = nombre.replace(match.group(0), "").strip() if match else nombre
@@ -345,16 +315,16 @@ async def cargar_traspaso(picking_id: int):
     p = picks[0]
     moves = await _rpc("stock.move", "search_read",
         [[["id", "in", p["move_ids"]]]],
-        {"fields": ["product_id", "product_uom_qty", "reference", "description_picking"]}
+        {"fields": ["product_id", "product_uom_qty", "name"]}
     )
     origen  = p["location_id"][1] if p.get("location_id") else ""
     destino = p["location_dest_id"][1] if p.get("location_dest_id") else ""
 
     productos = []
     for m in moves:
-        if (m.get("product_uom_qty") or 0) <= 0:
+        if m["product_uom_qty"] <= 0:
             continue
-        nombre = m["product_id"][1] if m.get("product_id") else (m.get("description_picking") or m.get("reference") or "")
+        nombre = m["product_id"][1] if m.get("product_id") else m["name"]
         match = re.match(r"^\[([^\]]+)\]", nombre)
         clave = match.group(1).strip() if match else nombre.split(" ")[0]
         desc  = nombre.replace(match.group(0), "").strip() if match else nombre
@@ -396,96 +366,3 @@ async def buscar_productos_venta(termino: str = "", limite: int = 50):
         "nombre":          p.get("name") or "",
         "existencia_odoo": p.get("qty_available", 0),
     } for p in productos if p.get("default_code")]
-
-
-# ── VALIDAR UN PDF CONTRA ODOO ───────────────────────────────────────────────
-async def productos_de_folio(folio: str):
-    """Busca la entrega por su folio (ej. ALM-PT/OUT/00791) y devuelve los datos tal
-    como los tiene Odoo, o None si no existe o Odoo no esta configurado."""
-    if not ODOO_URL or not folio:
-        return None
-    ids = await _rpc("stock.picking", "search", [[["name", "=", folio.strip()]]], {"limit": 1})
-    if not ids:
-        return None
-    return await cargar_entrega(ids)
-
-
-async def productos_de_orden(nombre_ov: str):
-    """Partidas de la orden de venta (ej. S122781) tal como estan en Odoo, o None.
-    Se usa cuando el PDF que se sube es la ORDEN DE VENTA y no la entrega."""
-    if not ODOO_URL or not nombre_ov:
-        return None
-    lineas = await _rpc("sale.order.line", "search_read",
-        [[["order_id.name", "=", nombre_ov.strip()], ["display_type", "=", False]]],
-        {"fields": ["product_id", "product_uom_qty"]})
-    if not lineas:
-        return None
-    acum = {}
-    for l in lineas:
-        if not l.get("product_id") or (l.get("product_uom_qty") or 0) <= 0:
-            continue
-        nombre = l["product_id"][1]
-        m = re.match(r"^\[([^\]]+)\]", nombre)
-        clave = m.group(1).strip() if m else nombre.split(" ")[0]
-        desc = nombre.replace(m.group(0), "").strip() if m else nombre
-        if clave in acum:
-            acum[clave]["cantidad_total"] += round(l["product_uom_qty"])
-        else:
-            acum[clave] = {"clave": clave, "descripcion": desc, "cantidad_total": round(l["product_uom_qty"]), "unidad": "PZA"}
-    return {"productos": list(acum.values())} if acum else None
-
-
-# ── DIAGNOSTICO DE COMPATIBILIDAD (para cambios de version de Odoo) ──────────
-# Todos los modelos y campos que usa Tarimas. Si Odoo cambia de version, el
-# diagnostico dice exactamente que falta, sin tener que probar pantalla por pantalla.
-CAMPOS_USADOS = {
-    "sale.order":      ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id", "partner_shipping_id"],
-    "stock.picking":   ["name", "partner_id", "sale_id", "move_ids", "state", "location_id", "location_dest_id",
-                        "origin", "scheduled_date", "picking_type_id"],
-    "stock.move":      ["product_id", "product_uom_qty", "quantity", "reference", "description_picking"],
-    "res.partner":     ["name", "street", "street2", "city", "state_id", "zip", "country_id"],
-    "stock.warehouse": ["name", "code", "view_location_id", "lot_stock_id"],
-    "stock.location":  ["usage"],
-    "product.product": ["default_code", "name", "qty_available", "sale_ok", "product_tag_ids"],
-    "sale.order.line": ["order_id", "product_id", "product_uom_qty", "display_type"],
-}
-
-async def verificar_compatibilidad():
-    reporte = {"servidor": None, "autenticacion": None, "modelos": [], "faltantes_en_uso": {}, "ok": True,
-               "alertas": [] if os.getenv("JWT_SECRET") else
-               ["JWT_SECRET no esta definida en Railway: las sesiones usan una clave por defecto que esta en el codigo. Definela con un valor largo y aleatorio."]}
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.post(ODOO_URL + "/jsonrpc", json={"jsonrpc": "2.0", "method": "call",
-                "params": {"service": "common", "method": "version", "args": []}})
-            reporte["servidor"] = (r.json().get("result") or {}).get("server_version")
-        except Exception as e:
-            reporte["servidor"] = f"error: {e}"; reporte["ok"] = False
-        try:
-            reporte["autenticacion"] = f"ok (uid {await _uid(client)})"
-        except Exception as e:
-            reporte["autenticacion"] = f"error: {e}"; reporte["ok"] = False
-            return reporte
-    _CAMPOS_CACHE.clear()
-    for modelo, campos in CAMPOS_USADOS.items():
-        validos = await _campos_modelo(modelo)
-        if not validos:
-            reporte["modelos"].append({"modelo": modelo, "estado": "sin acceso o no existe"}); reporte["ok"] = False
-            continue
-        faltan = [c for c in campos if c not in validos]
-        if faltan: reporte["ok"] = False
-        reporte["modelos"].append({"modelo": modelo, "estado": "ok" if not faltan else "faltan campos", "faltan": faltan})
-    # Pruebas reales de las consultas que usa el sistema (dominios incluidos)
-    pruebas = {
-        "OV confirmadas":       ("sale.order", [["state", "=", "sale"], ["picking_ids", "!=", False]]),
-        "Traspasos internos":   ("stock.picking", [["location_id.usage", "in", ["internal", "transit"]]]),
-        "Productos Maquinaria": ("product.product", [["sale_ok", "=", True], ["product_tag_ids.name", "=", "Maquinaria"]]),
-    }
-    reporte["consultas"] = {}
-    for etiqueta, (modelo, dominio) in pruebas.items():
-        try:
-            reporte["consultas"][etiqueta] = f"ok ({await _rpc_directo(modelo, 'search_count', [dominio])} registros)"
-        except Exception as e:
-            reporte["consultas"][etiqueta] = f"error: {e}"; reporte["ok"] = False
-    reporte["faltantes_en_uso"] = {m: sorted(v) for m, v in _CAMPOS_FALTANTES.items()}
-    return reporte

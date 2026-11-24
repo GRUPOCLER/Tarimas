@@ -7,7 +7,7 @@ from sqlalchemy import text
 load_dotenv()
 
 from database import engine, Base
-from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin, reimpresiones, analisis
+from routers import auth, entregas, catalogo, dashboard, setup, odoo, admin, reimpresiones, analisis, ov
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -128,10 +128,51 @@ async def lifespan(app: FastAPI):
             print(f"[migracion] OK: {stmt}")
         except Exception as e:
             print(f"[migracion] omitida ({stmt}): {type(e).__name__}: {e}")
-    import os as _os
-    if not _os.getenv("JWT_SECRET"):
-        print("[SEGURIDAD] JWT_SECRET no esta definida: se usa la clave por defecto del codigo. Definela en Railway.")
+    await _migrar_accesos_por_modulo()
+    await _asegurar_admins()
     yield
+
+async def _migrar_accesos_por_modulo():
+    """Una sola vez: pasa el rol global anterior a accesos por modulo.
+    operador/gerente -> Embarques con ese rol; sap/facturacion -> Refacciones.
+    Solo corre si usuario_modulos esta vacia (no vuelve a tocar lo que el admin ajuste)."""
+    try:
+        async with engine.begin() as conn:
+            n = (await conn.execute(text("SELECT COUNT(*) FROM usuario_modulos"))).scalar() or 0
+            if n:
+                return
+            rows = (await conn.execute(text("SELECT usuario, rol FROM usuarios WHERE rol <> 'admin'"))).all()
+            for usuario, rol in rows:
+                if rol in ("operador", "gerente"):
+                    mod, r = "embarques", rol
+                elif rol in ("sap", "facturacion"):
+                    mod, r = "refacciones", rol
+                else:
+                    mod, r = "embarques", "operador"
+                await conn.execute(text("INSERT INTO usuario_modulos (usuario, modulo, rol) VALUES (:u,:m,:r)"),
+                                   {"u": usuario, "m": mod, "r": r})
+            await conn.execute(text("UPDATE usuarios SET rol = 'usuario' WHERE rol <> 'admin'"))
+            print(f"[migracion] accesos por modulo: {len(rows)} usuarios migrados")
+    except Exception as e:
+        print(f"[migracion] accesos por modulo omitida: {type(e).__name__}: {e}")
+
+async def _asegurar_admins():
+    """Recuperacion de acceso: los usuarios o correos listados en la variable ADMIN_USUARIOS
+    (separados por coma, p. ej. "procesos,gestion@grupocler.com.mx") quedan como admin y activos
+    cada vez que arranca el servidor. Si la variable no existe, no hace nada."""
+    import os
+    lista = [x.strip().lower() for x in os.getenv("ADMIN_USUARIOS", "").split(",") if x.strip()]
+    if not lista:
+        return
+    try:
+        async with engine.begin() as conn:
+            for x in lista:
+                r = await conn.execute(
+                    text("UPDATE usuarios SET rol = 'admin', activo = true WHERE lower(usuario) = :x OR lower(email) = :x"),
+                    {"x": x})
+                print(f"[admin] {x}: {r.rowcount} usuario(s) dejados como admin")
+    except Exception as e:
+        print(f"[admin] ADMIN_USUARIOS omitido: {type(e).__name__}: {e}")
 
 app = FastAPI(
     title="Sistema Operativo GRUPO CLER",
@@ -159,6 +200,7 @@ app.include_router(odoo.router,      prefix="/api/odoo",      tags=["odoo"])
 app.include_router(admin.router,     prefix="/api/admin",     tags=["admin"])
 app.include_router(reimpresiones.router, prefix="/api/reimpresiones", tags=["reimpresiones"])
 app.include_router(analisis.router, prefix="/api/analisis", tags=["analisis"])
+app.include_router(ov.router, prefix="/api/ov", tags=["ov"])
 
 @app.get("/")
 def root():

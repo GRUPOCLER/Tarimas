@@ -12,13 +12,8 @@ from services.auth import verificar_token
 
 router = APIRouter()
 
-async def get_current_user(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Sin autorizacion")
-    payload = verificar_token(authorization.split(" ")[1])
-    if not payload:
-        raise HTTPException(status_code=401, detail="Token invalido")
-    return payload
+from services.permisos import acceso_modulo
+get_current_user = acceso_modulo("embarques")
 
 def require_roles(*roles):
     async def dep(user: dict = Depends(get_current_user)):

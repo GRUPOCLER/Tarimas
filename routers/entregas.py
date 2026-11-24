@@ -60,13 +60,8 @@ def _barcode_url(data: str, height: int = 50) -> str:
     )
 
 # ── DEPENDENCIA DE AUTH ──────────────────────────────────────
-async def get_current_user(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Sin autorizacion")
-    payload = verificar_token(authorization.split(" ")[1])
-    if not payload:
-        raise HTTPException(status_code=401, detail="Token invalido")
-    return payload
+from services.permisos import acceso_modulo
+get_current_user = acceso_modulo("embarques")
 
 def require_roles(*roles):
     async def dep(user: dict = Depends(get_current_user)):
@@ -406,13 +401,7 @@ async def crear_entrega(
                        f"Si es correcto, confirma para registrarla de todas formas."
             )
 
-    # El folio interno se arma con fecha y hora al segundo: si dos entregas se crean en el
-    # mismo segundo (dos usuarios, o una carga en lote) chocaban y la API respondia error 500.
-    base_id = _gen_id_entrega(body.sistema)
-    id_e, n = base_id, 1
-    while (await db.execute(select(Entrega.id_entrega).where(Entrega.id_entrega == id_e))).first():
-        n += 1
-        id_e = f"{base_id}-{n}"
+    id_e = _gen_id_entrega(body.sistema)
     entrega = Entrega(
         id_entrega     = id_e,
         num_entrega    = body.num_entrega,
@@ -479,33 +468,6 @@ async def procesar_pdf(
     else:
         datos = parsear_ecor(texto)
 
-    # Validacion contra Odoo: si el PDF es una entrega de Odoo con folio, las cantidades
-    # se toman de Odoo (fuente oficial). El PDF cambia de formato entre versiones de Odoo
-    # y llego a leer existencias en lugar de cantidades (Odoo 19). Si Odoo no responde,
-    # se usa lo leido del PDF.
-    aviso_odoo = None
-    es_entrega = "/OUT/" in (datos.get("num_entrega") or "")
-    es_orden = bool(re.match(r"^S\d{5,8}$", (datos.get("orden") or "").strip()))
-    if tipo == "ECOR_ODOO" and (es_entrega or es_orden):
-        try:
-            from services import odoo as odoo_svc
-            # Entrega (ALM-PT/OUT/...) -> cantidades de la entrega; orden de venta (S122781) -> de la OV
-            od = (await odoo_svc.productos_de_folio(datos["num_entrega"])) if es_entrega else \
-                 (await odoo_svc.productos_de_orden(datos["orden"]))
-        except Exception as e:
-            od = None
-            aviso_odoo = f"No se pudo validar contra Odoo ({e}); se usaron las cantidades del PDF."
-        if od and od.get("productos"):
-            leidas = {p["clave"].upper(): p["cantidad_total"] for p in datos.get("productos", [])}
-            oficiales = {p["clave"].upper(): p["cantidad_total"] for p in od["productos"]}
-            difs = [f"{k}: PDF {leidas.get(k, 0)} / Odoo {v}" for k, v in oficiales.items() if leidas.get(k) != v]
-            difs += [f"{k}: PDF {v} / no esta en Odoo" for k, v in leidas.items() if k not in oficiales]
-            datos["productos"] = od["productos"]
-            for campo in ("nombre_cliente", "direccion", "orden", "sucursal"):
-                if not datos.get(campo) and od.get(campo):
-                    datos[campo] = od[campo]
-            aviso_odoo = ("Cantidades tomadas de Odoo. Diferencias con el PDF: " + "; ".join(difs[:10])) if difs else None
-
     if not datos.get("productos"):
         raise HTTPException(status_code=422, detail="No se encontraron productos en el PDF")
 
@@ -514,10 +476,7 @@ async def procesar_pdf(
     datos["comercializador"] = datos.get("comercializador") or comercializador
     datos["forzar"]   = forzar
     body = EntregaIn(**datos)
-    resultado = await crear_entrega(body, db, user)
-    if aviso_odoo and isinstance(resultado, dict):
-        resultado["aviso"] = aviso_odoo
-    return resultado
+    return await crear_entrega(body, db, user)
 
 def _extraer_texto_pdf(contenido: bytes) -> str:
     import pdfplumber, io
@@ -632,15 +591,10 @@ async def asignar_productos(
 
     errores = []
     asignados = 0
-    if not any(a.cantidad > 0 for a in body.asignaciones):
-        raise HTTPException(status_code=400, detail="Indica al menos una cantidad mayor a cero")
     for asig in body.asignaciones:
         if asig.cantidad <= 0:
-            errores.append(f"Cantidad no valida ({asig.cantidad}) para {asig.id_producto}")
             continue
-        # FOR UPDATE: si dos personas asignan el mismo producto al mismo tiempo, la segunda
-        # espera a la primera y ve el pendiente ya descontado (evita asignar de mas)
-        pr = await db.execute(select(Producto).where(Producto.id_producto == asig.id_producto).with_for_update())
+        pr = await db.execute(select(Producto).where(Producto.id_producto == asig.id_producto))
         prod = pr.scalar_one_or_none()
         if not prod or prod.id_entrega not in ids_permitidos:
             errores.append(f"Producto no encontrado: {asig.id_producto}")

@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from database import get_db
 from services import auth as auth_svc
+from services.permisos import usuario_actual, catalogo
 
 router = APIRouter()
 
@@ -18,11 +19,15 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     return resultado
 
 @router.get("/verificar")
-async def verificar(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Sin token")
-    token = authorization.split(" ")[1]
-    payload = auth_svc.verificar_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Token invalido o expirado")
-    return {"ok": True, "usuario": payload["sub"], "rol": payload["rol"]}
+async def verificar(user: dict = Depends(usuario_actual)):
+    return {"ok": True, "usuario": user["sub"], "es_admin": user["rol"] == "admin"}
+
+@router.get("/yo")
+async def yo(user: dict = Depends(usuario_actual)):
+    """Datos frescos del usuario: a que modulos entra y con que rol."""
+    return {"usuario": user["sub"], "nombre": user.get("nombre"),
+            "es_admin": user["rol"] == "admin", "modulos": user["modulos"]}
+
+@router.get("/modulos")
+async def modulos(user: dict = Depends(usuario_actual)):
+    return catalogo()

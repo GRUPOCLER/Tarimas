@@ -176,25 +176,12 @@ async def quitar_almacen(id_almacen: int, db: AsyncSession = Depends(get_db), us
 @router.get("/diag/env")
 async def diag_env(user: dict = Depends(get_current_user)):
     """Muestra el valor RAW que el proceso ve ahora mismo para ODOO_DB."""
-    if user.get("rol") not in ("admin", "gerente"):
-        raise HTTPException(status_code=403, detail="Requiere admin o gerente")
     valor = os.getenv("ODOO_DB", "NO_DEFINIDA")
     return {
         "ODOO_DB_raw": repr(valor),
         "longitud": len(valor),
         "ODOO_DB_desde_modulo": repr(odoo_svc.ODOO_DB),
     }
-
-@router.get("/diag/compatibilidad")
-async def diag_compatibilidad(user: dict = Depends(get_current_user)):
-    """Revisa contra el Odoo conectado (ej. tras pasar de 17 a 19) que existan
-    todos los modelos y campos que usa Tarimas y que las consultas respondan."""
-    if user.get("rol") not in ("admin", "gerente"):
-        raise HTTPException(status_code=403, detail="Requiere admin o gerente")
-    try:
-        return await odoo_svc.verificar_compatibilidad()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
 
 @router.get("/diag/buscar-partner")
 async def diag_buscar_partner(nombre: str, user: dict = Depends(get_current_user)):

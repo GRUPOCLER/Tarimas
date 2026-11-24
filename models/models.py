@@ -206,3 +206,139 @@ class UsuarioAlmacen(Base):
     codigo             = Column(String(30))
     agregado_por       = Column(String(50))
     fecha_agregado     = Column(DateTime, server_default=func.now())
+
+
+# ══════════════════════════════════════════════════════════════
+#  CONTROL DE OV (refacciones): surtido -> preparacion -> entrega SAP -> factura
+# ══════════════════════════════════════════════════════════════
+class OrdenVenta(Base):
+    __tablename__ = "ordenes_venta"
+    id               = Column(String(30), primary_key=True)          # = num_ov de SAP
+    num_ov           = Column(String(30), unique=True, index=True)
+    fecha_ov         = Column(String(12))
+    emisor           = Column(String(120))                           # razon social que emite la OV
+    cliente          = Column(String(200), index=True)
+    cliente_codigo   = Column(String(30))
+    cliente_rfc      = Column(String(20))
+    destino          = Column(String(200))
+    destino_ciudad   = Column(String(120))
+    fecha_entrega    = Column(String(12))
+    fecha_cancelacion= Column(String(12))
+    referencia       = Column(String(200))
+    notas_json       = Column(Text)
+    permite_parcial  = Column(Boolean, default=False)
+    almacen          = Column(String(30))
+    moneda           = Column(String(8))
+    total            = Column(Float, default=0)
+    estatus          = Column(String(20), default="recibida", index=True)
+    estatus_desde    = Column(DateTime, server_default=func.now())
+    creado_en        = Column(DateTime, server_default=func.now())
+    creado_por       = Column(String(50))
+    nota_faltantes   = Column(Text)
+    # entrega SAP
+    entrega_folio    = Column(String(30), index=True)
+    entrega_fecha    = Column(String(12))
+    entrega_en       = Column(DateTime)
+    entrega_por      = Column(String(50))
+    # factura
+    factura_folio    = Column(String(30))
+    factura_uuid     = Column(String(40))
+    factura_fecha    = Column(String(12))
+    factura_en       = Column(DateTime)
+    factura_por      = Column(String(50))
+
+
+class OVLinea(Base):
+    __tablename__ = "ov_lineas"
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    ov_id            = Column(String(30), ForeignKey("ordenes_venta.id"), index=True, nullable=False)
+    linea            = Column(Integer)
+    codigo           = Column(String(60))
+    codigo_norm      = Column(String(60), index=True)
+    descripcion      = Column(Text)
+    cantidad         = Column(Integer, default=0)
+    surtida          = Column(Integer, default=0)
+    empacada         = Column(Integer, default=0)
+    precio           = Column(Float, default=0)
+    tipo             = Column(String(40))
+    marca            = Column(String(60))
+    division         = Column(String(60))
+    grupo            = Column(String(80))
+    en_mezanine      = Column(Boolean, default=False)
+    motivo_faltante  = Column(String(200))
+    entrega_cantidad = Column(Integer)          # lo que quedo en la entrega de SAP (conciliacion)
+    entrega_lotes    = Column(Text)             # JSON [{lote, cantidad}]
+
+
+class OVEvento(Base):
+    __tablename__ = "ov_eventos"
+    id      = Column(Integer, primary_key=True, autoincrement=True)
+    ov_id   = Column(String(30), ForeignKey("ordenes_venta.id"), index=True, nullable=False)
+    estatus = Column(String(20))
+    en      = Column(DateTime, server_default=func.now())
+    por     = Column(String(50))
+    nota    = Column(Text)
+
+
+class OVEscaneo(Base):
+    __tablename__ = "ov_escaneos"
+    id       = Column(Integer, primary_key=True, autoincrement=True)
+    ov_id    = Column(String(30), ForeignKey("ordenes_venta.id"), index=True, nullable=False)
+    linea_id = Column(Integer, index=True)
+    caja_id  = Column(Integer)
+    etapa    = Column(String(15))               # surtido | preparacion
+    cantidad = Column(Integer)                  # negativo = correccion
+    codigo   = Column(String(60))
+    metodo   = Column(String(10), default="scan")   # scan | manual | total
+    usuario  = Column(String(50))
+    ts       = Column(DateTime, server_default=func.now())
+
+
+class OVCaja(Base):
+    __tablename__ = "ov_cajas"
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    ov_id            = Column(String(30), ForeignKey("ordenes_venta.id"), index=True, nullable=False)
+    numero           = Column(Integer)
+    estatus          = Column(String(10), default="abierta")      # abierta | cerrada
+    peso_kg          = Column(Float)
+    creada_en        = Column(DateTime, server_default=func.now())
+    creada_por       = Column(String(50))
+    cerrada_en       = Column(DateTime)
+    cerrada_por      = Column(String(50))
+    impresa_veces    = Column(Integer, default=0)
+    primera_impresion_en  = Column(DateTime)
+    ultima_impresion_en   = Column(DateTime)
+    ultima_impresion_por  = Column(String(50))
+
+
+class OVCajaItem(Base):
+    __tablename__ = "ov_caja_items"
+    id       = Column(Integer, primary_key=True, autoincrement=True)
+    caja_id  = Column(Integer, ForeignKey("ov_cajas.id"), index=True, nullable=False)
+    linea_id = Column(Integer, index=True)
+    cantidad = Column(Integer, default=0)
+
+
+class CatalogoRefacciones(Base):
+    """Maestro de categorias (archivo CATEGORIAS de SAP): tipo, marca, division, grupo."""
+    __tablename__ = "catalogo_refacciones"
+    codigo_norm = Column(String(60), primary_key=True)
+    codigo      = Column(String(60))
+    descripcion = Column(Text)
+    tipo        = Column(String(40))
+    marca       = Column(String(60))
+    division    = Column(String(60))
+    grupo       = Column(String(80))
+    en_catalogo = Column(Boolean, default=False)
+    en_mezanine = Column(Boolean, default=False)
+
+
+# ── ACCESO POR MODULO ────────────────────────────────────────
+class UsuarioModulo(Base):
+    """Un usuario tiene acceso a un modulo con un rol propio en ese modulo.
+    Los admin entran a todo y no necesitan filas aqui."""
+    __tablename__ = "usuario_modulos"
+    id      = Column(Integer, primary_key=True, autoincrement=True)
+    usuario = Column(String(50), nullable=False, index=True)
+    modulo  = Column(String(20), nullable=False)
+    rol     = Column(String(20), nullable=False, default="operador")

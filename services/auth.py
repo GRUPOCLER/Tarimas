@@ -52,9 +52,11 @@ async def login(db: AsyncSession, usuario: str, password: str):
     usu.ultimo_acceso = datetime.utcnow()
     await db.commit()
     await _log(db, usuario, "LOGIN", "Sesion iniciada", True)
-    token = crear_token({"sub": usu.usuario, "rol": usu.rol, "nombre": usu.nombre_display})
+    from services.permisos import modulos_de
+    token = crear_token({"sub": usu.usuario, "nombre": usu.nombre_display})
     return {"token": token, "usuario": usu.usuario, "nombre": usu.nombre_display,
-            "rol": usu.rol, "expira_horas": TOKEN_HORAS}
+            "es_admin": usu.rol == "admin", "modulos": await modulos_de(db, usu),
+            "expira_horas": TOKEN_HORAS}
 
 async def _log(db: AsyncSession, usuario: str, accion: str, detalle: str, exito: bool):
     db.add(LogAcceso(usuario=usuario, accion=accion, detalle=detalle, exito=exito))

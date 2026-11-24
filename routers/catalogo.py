@@ -18,13 +18,8 @@ router = APIRouter()
 GOOGLE_SHEET_CATALOGO_ID   = os.getenv("GOOGLE_SHEET_CATALOGO_ID", "12Ewr2SvJXRt-g5HqGo-JrnJ07mv3vXboHU7Y2Gfkedw")
 GOOGLE_SHEET_CATALOGO_HOJA = os.getenv("GOOGLE_SHEET_CATALOGO_HOJA", "CATALOGO_V2")
 
-async def get_current_user(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Sin autorizacion")
-    payload = verificar_token(authorization.split(" ")[1])
-    if not payload:
-        raise HTTPException(status_code=401, detail="Token invalido")
-    return payload
+from services.permisos import acceso_modulo
+get_current_user = acceso_modulo("embarques")
 
 # Nombres de columna aceptados en el Excel/CSV — flexible por si el
 # archivo real trae variantes de mayusculas/espacios/acentos.
