@@ -125,7 +125,7 @@ async def cargar_entrega(picking_ids: list):
     validada = p.get("state") == "done"
     moves = await _rpc("stock.move", "search_read",
         [[["id", "in", p["move_ids"]]]],
-        {"fields": ["product_id", "product_uom_qty", "quantity", "name"]}
+        {"fields": ["product_id", "product_uom_qty", "quantity"]}
     )
     productos = []
     for m in moves:
@@ -138,7 +138,7 @@ async def cargar_entrega(picking_ids: list):
         cantidad = m.get("quantity", 0) if validada else m.get("product_uom_qty", 0)
         if cantidad <= 0:
             continue
-        nombre = m["product_id"][1] if m.get("product_id") else m["name"]
+        nombre = m["product_id"][1] if m.get("product_id") else (m.get("name") or "")
         match = re.match(r"^\[([^\]]+)\]", nombre)
         clave = match.group(1).strip() if match else nombre.split(" ")[0]
         desc  = nombre.replace(match.group(0), "").strip() if match else nombre
@@ -315,7 +315,7 @@ async def cargar_traspaso(picking_id: int):
     p = picks[0]
     moves = await _rpc("stock.move", "search_read",
         [[["id", "in", p["move_ids"]]]],
-        {"fields": ["product_id", "product_uom_qty", "name"]}
+        {"fields": ["product_id", "product_uom_qty"]}
     )
     origen  = p["location_id"][1] if p.get("location_id") else ""
     destino = p["location_dest_id"][1] if p.get("location_dest_id") else ""
@@ -324,7 +324,7 @@ async def cargar_traspaso(picking_id: int):
     for m in moves:
         if m["product_uom_qty"] <= 0:
             continue
-        nombre = m["product_id"][1] if m.get("product_id") else m["name"]
+        nombre = m["product_id"][1] if m.get("product_id") else (m.get("name") or "")
         match = re.match(r"^\[([^\]]+)\]", nombre)
         clave = match.group(1).strip() if match else nombre.split(" ")[0]
         desc  = nombre.replace(match.group(0), "").strip() if match else nombre
