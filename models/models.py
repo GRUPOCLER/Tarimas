@@ -137,10 +137,24 @@ class CatalogoItem(Base):
     sat_desc       = Column(Text)
     actualizado_en = Column(DateTime, server_default=func.now())
     # Gestion local: campos editados en la plataforma (JSON ["peso_unit", ...]); la hoja ya no los pisa
+    linea          = Column(String(12))  # 'refaccion' | None (equipo)
     campos_manuales = Column(Text)
     origen          = Column(String(12), default="hoja")      # hoja | manual
     editado_por     = Column(String(50))
     editado_en      = Column(DateTime)
+    # Fuente por campo: lo que dijo la hoja (JSON) y de donde sale el valor vigente (hoja | odoo | manual | sin_dato)
+    valores_hoja    = Column(Text)
+    fuentes         = Column(Text)
+
+
+class CatalogoOdoo(Base):
+    """Copia (solo lectura) de lo que Odoo tiene de cada producto: peso, volumen, medidas y empaques."""
+    __tablename__ = "catalogo_odoo"
+    sku            = Column(String(40), primary_key=True)
+    encontrado     = Column(Boolean, default=False)
+    odoo_id        = Column(Integer)
+    datos          = Column(Text)          # JSON con los valores ya convertidos a kg / cm / m3
+    sincronizado_en = Column(DateTime, server_default=func.now())
 
 
 class CatalogoHistorial(Base):

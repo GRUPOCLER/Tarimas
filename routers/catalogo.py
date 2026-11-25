@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header, BackgroundTasks, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, or_
 from pydantic import BaseModel
 from typing import Optional
 from urllib.parse import quote
 import io, os, csv, re, json, httpx
+from datetime import datetime
 
 from database import get_db
-from models.models import CatalogoItem, CatalogoHistorial, CatalogoAdicional
+from models.models import CatalogoItem, CatalogoHistorial, CatalogoAdicional, CatalogoOdoo
 from services.auth import verificar_token
 
 router = APIRouter()
@@ -19,8 +20,16 @@ router = APIRouter()
 GOOGLE_SHEET_CATALOGO_ID   = os.getenv("GOOGLE_SHEET_CATALOGO_ID", "12Ewr2SvJXRt-g5HqGo-JrnJ07mv3vXboHU7Y2Gfkedw")
 GOOGLE_SHEET_CATALOGO_HOJA = os.getenv("GOOGLE_SHEET_CATALOGO_HOJA", "CATALOGO_V2")
 
-from services.permisos import acceso_modulo
-get_current_user = acceso_modulo("embarques")
+from services.permisos import usuario_actual
+
+
+async def get_current_user(user: dict = Depends(usuario_actual)):
+    """Catalogo compartido: entra quien tenga Embarques o Refacciones. El rol efectivo es el mas alto de los dos."""
+    roles = [user["modulos"].get(m) for m in ("embarques", "refacciones")]
+    if not any(roles):
+        raise HTTPException(status_code=403, detail="No tienes acceso a este modulo")
+    rol = "admin" if "admin" in roles else "gerente" if "gerente" in roles else "operador"
+    return {**user, "rol": rol, "modulo": "embarques"}
 
 # Nombres de columna aceptados en el Excel/CSV — flexible por si el
 # archivo real trae variantes de mayusculas/espacios/acentos.
@@ -125,12 +134,66 @@ def _igual(a, b) -> bool:
     return (a or "") == (b or "")
 
 
-async def _upsert_catalogo(db: AsyncSession, filas: list, usuario: str = "sistema") -> dict:
+def _json(txt, defecto):
+    try:
+        v = json.loads(txt) if txt else defecto
+        return v if isinstance(v, type(defecto)) else defecto
+    except Exception:
+        return defecto
+
+
+CAMPOS_ODOO = ("peso_unit", "m3_unit", "lr_unit", "an_unit", "al_unit", "cm_cant", "cm_lr", "cm_an", "cm_al")
+
+
+def _recalcular(db, item, hoja: dict, odoo, usuario: str, motivo_base: str) -> int:
+    """Fija el valor vigente de cada campo con la prioridad: editado aqui > Odoo (si tiene dato) > hoja.
+    Registra en el historial lo que cambie por esta causa y deja anotada la fuente de cada campo."""
+    manual = _manuales(item)
+    fuentes = _json(item.fuentes, {})
+    cambios = 0
+    for campo in CAMPOS_FLOAT + CAMPOS_INT:
+        if campo in manual:
+            fuentes[campo] = "manual"
+            continue
+        ov = (odoo or {}).get(campo) if (odoo or {}).get("encontrado") else None
+        hv = hoja.get(campo)
+        if ov and ov > 0:
+            nuevo, f = ov, "odoo"
+        elif hv and hv > 0:
+            nuevo, f = hv, "hoja"
+        else:
+            nuevo, f = (hv or 0), "sin_dato"
+        if campo in CAMPOS_INT:
+            nuevo = int(round(nuevo))
+        ant = getattr(item, campo)
+        if not _igual(ant, nuevo):
+            db.add(CatalogoHistorial(sku=item.sku, campo=campo, valor_anterior=_txt(ant), valor_nuevo=_txt(nuevo),
+                                     origen=("odoo" if f == "odoo" else "hoja"), motivo=motivo_base, usuario=usuario))
+            setattr(item, campo, nuevo)
+            cambios += 1
+        fuentes[campo] = f
+    item.fuentes = json.dumps(fuentes)
+    return cambios
+
+
+async def _snapshots_odoo(db) -> dict:
+    r = await db.execute(select(CatalogoOdoo))
+    out = {}
+    for o in r.scalars():
+        d = _json(o.datos, {})
+        d["encontrado"] = bool(o.encontrado)
+        d["odoo_id"] = o.odoo_id
+        out[o.sku] = d
+    return out
+
+
+async def _upsert_catalogo(db: AsyncSession, filas: list, usuario: str = "sistema", commit: bool = True) -> dict:
     """Recibe una lista de dicts ya normalizados (claves como 'sku', 'cm_cant', etc.) y hace insert/update en la
-    tabla catalogo. Los campos que se editaron en la plataforma NO se pisan, y cada cambio queda en el historial.
-    Compartido entre /importar y /sincronizar-drive."""
+    tabla catalogo. Guarda lo que dice la hoja y calcula el valor vigente (editado aqui > Odoo > hoja); cada cambio
+    queda en el historial. Compartido entre /importar y /sincronizar-drive."""
     insertados, actualizados, omitidos, protegidos = 0, 0, 0, 0
     cambios = 0
+    snaps = await _snapshots_odoo(db)
     for fila in filas:
         sku = str(fila.get("sku") or "").strip().upper()
         if not sku:
@@ -141,44 +204,44 @@ async def _upsert_catalogo(db: AsyncSession, filas: list, usuario: str = "sistem
         item = existente.scalar_one_or_none()
         es_nuevo = item is None
         if es_nuevo:
-            item = CatalogoItem(sku=sku, origen="hoja")
+            item = CatalogoItem(sku=sku, origen="hoja", linea=fila.get("linea") or None)
             db.add(item)
 
-        nuevos = {
-            "descripcion": str(fila.get("descripcion") or (item.descripcion or "")),
-            "sat_codigo": str(fila.get("sat_codigo") or "") or None,
-            "sat_desc": str(fila.get("sat_desc") or "") or None,
-        }
-        for c in CAMPOS_FLOAT:
-            nuevos[c] = _num(fila.get(c))
+        # lo que dice la hoja (descripcion y SAT solo vienen de la hoja)
+        desc = str(fila.get("descripcion") or (item.descripcion or ""))
+        sat_c = str(fila.get("sat_codigo") or "") or None
+        sat_d = str(fila.get("sat_desc") or "") or None
+        hoja = {c: _num(fila.get(c)) for c in CAMPOS_FLOAT}
         for c in CAMPOS_INT:
-            nuevos[c] = _num(fila.get(c), es_entero=True)
-
+            hoja[c] = _num(fila.get(c), es_entero=True)
         manual = set() if es_nuevo else _manuales(item)
-        hubo = False
-        for campo, val in nuevos.items():
+        for campo, val in (("descripcion", desc), ("sat_codigo", sat_c), ("sat_desc", sat_d)):
             if campo in manual:
-                if not _igual(getattr(item, campo), val):
-                    protegidos += 1
-                continue
-            if es_nuevo:
-                setattr(item, campo, val)
                 continue
             ant = getattr(item, campo)
-            if not _igual(ant, val):
-                db.add(CatalogoHistorial(sku=sku, campo=campo, valor_anterior=_txt(ant), valor_nuevo=_txt(val),
-                                         origen="hoja", motivo="Sincronizacion / importacion", usuario=usuario))
+            if es_nuevo:
                 setattr(item, campo, val)
-                hubo = True
+            elif not _igual(ant, val):
+                db.add(CatalogoHistorial(sku=sku, campo=campo, valor_anterior=_txt(ant), valor_nuevo=_txt(val), origen="hoja",
+                                         motivo="Sincronizacion / importacion", usuario=usuario))
+                setattr(item, campo, val)
                 cambios += 1
+        item.valores_hoja = json.dumps(hoja)
+        for campo in manual:
+            if campo in hoja and not _igual(getattr(item, campo), hoja[campo]):
+                protegidos += 1
+        cambios += _recalcular(db, item, hoja, snaps.get(sku), usuario, "Sincronizacion / importacion")
+
         if es_nuevo:
-            db.add(CatalogoHistorial(sku=sku, campo="(alta)", valor_nuevo=nuevos["descripcion"], origen="hoja",
-                                     motivo="Alta desde la hoja", usuario=usuario))
+            db.add(CatalogoHistorial(sku=sku, campo="(alta)", valor_nuevo=desc, origen="hoja", motivo="Alta desde la hoja", usuario=usuario))
             insertados += 1
         else:
             actualizados += 1
 
-    await db.commit()
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
     return {"insertados": insertados, "actualizados": actualizados, "omitidos": omitidos, "total_filas": len(filas),
             "cambios_registrados": cambios, "campos_protegidos": protegidos}
 
@@ -356,7 +419,8 @@ def _ser_item(i: CatalogoItem) -> dict:
         "peso_unit": i.peso_unit or 0, "lr_unit": i.lr_unit or 0, "an_unit": i.an_unit or 0, "al_unit": i.al_unit or 0, "m3_unit": i.m3_unit or 0,
         "cm_cant": i.cm_cant or 0, "cm_peso": i.cm_peso or 0, "cm_lr": i.cm_lr or 0, "cm_an": i.cm_an or 0, "cm_al": i.cm_al or 0, "cm_m3": i.cm_m3 or 0,
         "sat_codigo": i.sat_codigo or "", "sat_desc": i.sat_desc or "",
-        "campos_manuales": sorted(_manuales(i)), "origen": i.origen or "hoja",
+        "campos_manuales": sorted(_manuales(i)), "origen": i.origen or "hoja", "linea": i.linea or "equipo",
+        "fuentes": _json(i.fuentes, {}),
         "editado_por": i.editado_por, "editado_en": _iso(i.editado_en),
     }
 
@@ -402,11 +466,15 @@ def _numero(valor, campo):
 
 
 @router.get("/gestion")
-async def gestion_listar(buscar: str = "", filtro: str = "todos", limite: int = 60, pagina: int = 0,
+async def gestion_listar(buscar: str = "", filtro: str = "todos", linea: str = "", limite: int = 60, pagina: int = 0,
                          db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     limite = max(1, min(limite, 200))
     con_adic = select(CatalogoAdicional.sku_base).where(CatalogoAdicional.activo == True)  # noqa: E712
     q = select(CatalogoItem)
+    if linea == "refacciones":
+        q = q.where(CatalogoItem.linea == "refaccion")
+    elif linea == "equipos":
+        q = q.where(or_(CatalogoItem.linea == None, CatalogoItem.linea != "refaccion"))  # noqa: E711
     if buscar.strip():
         p = f"%{buscar.strip()}%"
         q = q.where(CatalogoItem.sku.ilike(p) | CatalogoItem.descripcion.ilike(p))
@@ -436,6 +504,7 @@ async def gestion_listar(buscar: str = "", filtro: str = "todos", limite: int = 
         "sin_master": (await db.execute(select(func.count(CatalogoItem.sku)).where(or_(CatalogoItem.cm_cant == None, CatalogoItem.cm_cant <= 0)))).scalar() or 0,  # noqa: E711
         "editados": (await db.execute(select(func.count(CatalogoItem.sku)).where(CatalogoItem.campos_manuales.is_not(None), CatalogoItem.campos_manuales != "[]"))).scalar() or 0,
         "con_adicionales": len((await db.execute(select(CatalogoAdicional.sku_base).where(CatalogoAdicional.activo == True).distinct())).all()),  # noqa: E712
+        "refacciones": (await db.execute(select(func.count(CatalogoItem.sku)).where(CatalogoItem.linea == "refaccion"))).scalar() or 0,
     }
     return {"total": total, "pagina": pagina, "limite": limite, "items": items, "resumen": resumen,
             "puede_editar": user.get("rol") in ("admin", "gerente")}
@@ -520,6 +589,10 @@ def _aplicar_edicion(db, item: CatalogoItem, campos: dict, motivo: str, usuario:
                     cambiados.append(m3c)
     if cambiados:
         item.campos_manuales = json.dumps(sorted(manual))
+        fu = _json(item.fuentes, {})
+        for c in cambiados:
+            fu[c] = "manual"
+        item.fuentes = json.dumps(fu)
         item.origen = "manual" if item.origen == "manual" else (item.origen or "hoja")
         item.editado_por = usuario
         item.editado_en = func.now()
@@ -576,6 +649,10 @@ async def gestion_liberar(sku: str, body: LiberarIn, db: AsyncSession = Depends(
         db.add(CatalogoHistorial(sku=i.sku, campo=c, valor_anterior=None, valor_nuevo=None, origen="manual",
                                  motivo="Se devolvió el campo a la sincronización de la hoja", usuario=user["sub"]))
     i.campos_manuales = json.dumps(sorted(manual))
+    if quitar and i.valores_hoja:
+        # el campo vuelve a tomar el valor de Odoo (si tiene) o de la hoja
+        snap = (await _snapshots_odoo(db)).get(i.sku)
+        _recalcular(db, i, _json(i.valores_hoja, {}), snap, user["sub"], "Se devolvió el campo a Odoo / hoja")
     await db.commit()
     return {"ok": True, "liberados": quitar}
 
@@ -653,3 +730,298 @@ async def gestion_avisos(db: AsyncSession = Depends(get_db), user: dict = Depend
         if a:
             out.append({"sku": i.sku, "descripcion": i.descripcion, "avisos": a})
     return {"total": len(out), "items": out[:300]}
+
+
+# ═════════════════════ ODOO (solo lectura) + COMPARACION + EXPORTACION ═════════════════════
+# Prioridad de cada dato del producto: editado aqui > Odoo (si tiene dato) > hoja de Google.
+ETIQ_CAMPO.update({"lr_unit": "Largo (cm)"})
+CAMPOS_COMPARA = ("peso_unit", "m3_unit", "lr_unit", "an_unit", "al_unit", "cm_cant", "cm_lr", "cm_an", "cm_al")
+_estado_odoo = {"corriendo": False, "total": 0, "hechos": 0, "inicio": None, "fin": None, "error": None, "resultado": None, "por": None}
+
+
+@router.get("/gestion/odoo/diagnostico")
+async def odoo_diagnostico(sku: str = "", user: dict = Depends(get_current_user)):
+    """Que campos de peso / medidas / empaques existen en este Odoo (y, opcional, lo que devuelve para un producto)."""
+    _exigir_edicion(user)
+    from services import odoo as odoo_srv
+    odoo_srv.reset_cache_campos()
+    try:
+        return await odoo_srv.diagnostico_catalogo(sku)
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo consultar Odoo: {e}")
+
+
+@router.get("/gestion/odoo/estado")
+async def odoo_estado(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    ult = (await db.execute(select(func.max(CatalogoOdoo.sincronizado_en)))).scalar()
+    n = (await db.execute(select(func.count(CatalogoOdoo.sku)))).scalar() or 0
+    enc = (await db.execute(select(func.count(CatalogoOdoo.sku)).where(CatalogoOdoo.encontrado == True))).scalar() or 0  # noqa: E712
+    return {**_estado_odoo, "ultima_sincronizacion": _iso(ult), "productos_consultados": n, "encontrados": enc}
+
+
+async def _trabajo_sincronizar_odoo(usuario: str):
+    from database import AsyncSessionLocal
+    from services import odoo as odoo_srv
+    st = _estado_odoo
+    st.update({"corriendo": True, "hechos": 0, "total": 0, "error": None, "resultado": None, "inicio": _iso(datetime.utcnow()), "fin": None, "por": usuario})
+    try:
+        odoo_srv.reset_cache_campos()
+        async with AsyncSessionLocal() as db:
+            skus = [r[0] for r in (await db.execute(select(CatalogoItem.sku).order_by(CatalogoItem.sku))).all()]
+        st["total"] = len(skus)
+        res = {"encontrados": 0, "no_encontrados": 0, "cambios_registrados": 0, "con_peso": 0, "con_empaque": 0, "empaques_ambiguos": 0}
+        for k in range(0, len(skus), 80):
+            lote = skus[k:k + 80]
+            datos = await odoo_srv.leer_catalogo_odoo(lote)
+            async with AsyncSessionLocal() as db:
+                for sku in lote:
+                    d = datos.get(sku) or {"encontrado": False}
+                    snap = await db.get(CatalogoOdoo, sku)
+                    if not snap:
+                        snap = CatalogoOdoo(sku=sku)
+                        db.add(snap)
+                    snap.encontrado = bool(d.get("encontrado"))
+                    snap.odoo_id = d.get("odoo_id")
+                    snap.datos = json.dumps({k2: v for k2, v in d.items() if k2 not in ("encontrado", "odoo_id")})
+                    snap.sincronizado_en = datetime.utcnow()
+                    if d.get("encontrado"):
+                        res["encontrados"] += 1
+                        res["con_peso"] += 1 if (d.get("peso_unit") or 0) > 0 else 0
+                        res["con_empaque"] += 1 if (d.get("cm_cant") or 0) > 0 else 0
+                        res["empaques_ambiguos"] += 1 if d.get("empaque_ambiguo") else 0
+                    else:
+                        res["no_encontrados"] += 1
+                    item = await db.get(CatalogoItem, sku)
+                    if item and item.valores_hoja:
+                        res["cambios_registrados"] += _recalcular(db, item, _json(item.valores_hoja, {}), {**d}, usuario, "Sincronización con Odoo")
+                await db.commit()
+            st["hechos"] = min(len(skus), k + 80)
+        st["resultado"] = res
+    except Exception as e:
+        st["error"] = str(e)[:300]
+    finally:
+        st["corriendo"] = False
+        st["fin"] = _iso(datetime.utcnow())
+
+
+@router.post("/gestion/odoo/sincronizar")
+async def odoo_sincronizar(fondo: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """Lee de Odoo (solo lectura) peso, volumen, medidas y empaques de todos los productos del catalogo."""
+    _exigir_edicion(user)
+    if _estado_odoo["corriendo"]:
+        raise HTTPException(409, "Ya hay una sincronización con Odoo en curso.")
+    fondo.add_task(_trabajo_sincronizar_odoo, user["sub"])
+    _estado_odoo.update({"corriendo": True, "hechos": 0, "total": 0, "error": None, "resultado": None})
+    return {"ok": True}
+
+
+def _clasifica(local, odoo, campo):
+    """igual | diferente | solo_local | solo_odoo | sin_dato"""
+    l, o = (local or 0), (odoo or 0)
+    if l > 0 and o > 0:
+        tol = 0.0 if campo == "cm_cant" else max(0.01 * max(l, o), 1e-6)
+        return "igual" if abs(l - o) <= tol else "diferente"
+    if l > 0:
+        return "solo_local"
+    if o > 0:
+        return "solo_odoo"
+    return "sin_dato"
+
+
+def _posible_unidad(l, o):
+    if l and o and l > 0 and o > 0:
+        r = o / l
+        for f in (1000, 100, 10, 0.1, 0.01, 0.001):
+            if abs(r - f) / f < 0.05:
+                return True
+    return False
+
+
+async def _filas_comparacion(db):
+    items = list((await db.execute(select(CatalogoItem).order_by(CatalogoItem.sku))).scalars())
+    snaps = await _snapshots_odoo(db)
+    filas = []
+    for i in items:
+        sn = snaps.get(i.sku)
+        manual = _manuales(i)
+        hoja = _json(i.valores_hoja, {})
+        row = {"sku": i.sku, "descripcion": i.descripcion or "", "en_odoo": bool(sn and sn.get("encontrado")), "consultado": sn is not None,
+               "odoo_id": (sn or {}).get("odoo_id"), "campos": {}, "empaque_ambiguo": bool((sn or {}).get("empaque_ambiguo"))}
+        estados = []
+        for c in CAMPOS_COMPARA:
+            local = getattr(i, c) if c in manual else (hoja.get(c) if hoja else getattr(i, c))
+            ov = (sn or {}).get(c) if row["en_odoo"] else None
+            est = _clasifica(local, ov, c) if row["en_odoo"] else ("solo_local" if (local or 0) > 0 else "sin_dato")
+            row["campos"][c] = {"local": local or 0, "odoo": ov or 0, "estado": est, "editado": c in manual,
+                                "unidad_dudosa": est == "diferente" and _posible_unidad(local, ov)}
+            estados.append(est)
+        if not row["consultado"]:
+            row["estado"] = "sin_consultar"
+        elif not row["en_odoo"]:
+            row["estado"] = "no_en_odoo"
+        elif "diferente" in estados:
+            row["estado"] = "diferencias"
+        elif "solo_local" in estados:
+            row["estado"] = "falta_en_odoo"
+        elif all(e in ("igual", "solo_odoo", "sin_dato") for e in estados) and any(e in ("igual", "solo_odoo") for e in estados):
+            row["estado"] = "coincide"
+        else:
+            row["estado"] = "sin_datos"
+        filas.append(row)
+    return filas
+
+
+@router.get("/gestion/odoo/comparar")
+async def comparar(estado: str = "diferencias", buscar: str = "", limite: int = 60, pagina: int = 0,
+                   db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    filas = await _filas_comparacion(db)
+    resumen = {k: 0 for k in ("total", "sin_consultar", "no_en_odoo", "diferencias", "falta_en_odoo", "coincide", "sin_datos")}
+    por_campo = {c: {"igual": 0, "diferente": 0, "solo_local": 0, "solo_odoo": 0, "sin_dato": 0} for c in CAMPOS_COMPARA}
+    for r in filas:
+        resumen["total"] += 1
+        resumen[r["estado"]] += 1
+        if r["en_odoo"]:
+            for c, v in r["campos"].items():
+                por_campo[c][v["estado"]] += 1
+    sel = [r for r in filas if estado in ("todos", "", r["estado"])]
+    if buscar.strip():
+        b = buscar.strip().lower()
+        sel = [r for r in sel if b in r["sku"].lower() or b in (r["descripcion"] or "").lower()]
+    limite = max(1, min(limite, 200))
+    page = sel[pagina * limite:(pagina + 1) * limite]
+    return {"resumen": resumen, "por_campo": por_campo, "total": len(sel), "limite": limite, "pagina": pagina, "items": page,
+            "estado": {k: _estado_odoo[k] for k in ("corriendo", "hechos", "total", "error", "resultado")}}
+
+
+def _csv(filas, cols) -> Response:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    for f in filas:
+        w.writerow([("" if v is None else v) for v in f])
+    return buf.getvalue()
+
+
+@router.get("/gestion/exportar/{tipo}")
+async def exportar(tipo: str, incluir: str = "faltantes", db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """CSV para cargar a Odoo despues (importacion nativa de Odoo). Tipos: productos | empaques | no_en_odoo | completo.
+    incluir=faltantes (solo donde Odoo no tiene el dato) o todo (tambien donde difiere)."""
+    _exigir_edicion(user)
+    filas = await _filas_comparacion(db)
+    snaps = await _snapshots_odoo(db)
+    items = {i.sku: i for i in (await db.execute(select(CatalogoItem))).scalars()}
+    cab = {"Content-Disposition": f'attachment; filename="{tipo}.csv"'}
+
+    def devolver(texto):
+        return Response(content="﻿" + texto, media_type="text/csv; charset=utf-8", headers=cab)
+
+    if tipo == "no_en_odoo":
+        rows = [(r["sku"], r["descripcion"], items[r["sku"]].peso_unit, items[r["sku"]].cm_cant) for r in filas if r["estado"] == "no_en_odoo"]
+        return devolver(_csv(rows, ["default_code", "name", "weight", "piezas_caja_master"]))
+
+    if tipo == "productos":
+        hay_dims = any((snaps.get(r["sku"]) or {}).get("tiene_campos_dim") for r in filas)
+        cols = [".id", "default_code", "weight", "volume"] + (["product_length", "product_width", "product_height"] if hay_dims else [])
+        rows = []
+        for r in filas:
+            if not r["en_odoo"] or not r["odoo_id"]:
+                continue
+            sn = snaps.get(r["sku"]) or {}
+            f = sn.get("dim_factor") or 1.0
+            mapa = {"weight": "peso_unit", "volume": "m3_unit", "product_length": "lr_unit", "product_width": "an_unit", "product_height": "al_unit"}
+            vals, hay = {}, False
+            for col, campo in mapa.items():
+                if col not in cols:
+                    continue
+                c = r["campos"][campo]
+                suben = (c["estado"] == "solo_local") or (incluir == "todo" and c["estado"] == "diferente")
+                if suben:
+                    v = c["local"] / f if col.startswith("product_") else c["local"]
+                    vals[col] = round(v, 6)
+                    hay = True
+            if hay:
+                rows.append([r["odoo_id"], r["sku"]] + [vals.get(c, "") for c in cols[2:]])
+        return devolver(_csv(rows, cols))
+
+    if tipo == "empaques":
+        from services import odoo as odoo_srv
+        if not await odoo_srv._modelo_existe("product.packaging"):
+            raise HTTPException(409, "Este Odoo no tiene el modelo de empaques (product.packaging). Pide el diagnóstico para adaptar la exportación.")
+        rows = []
+        for r in filas:
+            if not r["en_odoo"] or not r["odoo_id"]:
+                continue
+            c = r["campos"]["cm_cant"]
+            if c["estado"] == "solo_local" or (incluir == "todo" and c["estado"] == "diferente"):
+                rows.append([r["odoo_id"], "Caja master", int(c["local"])])
+        return devolver(_csv(rows, ["product_id/.id", "name", "qty"]))
+
+    if tipo == "completo":
+        ad = {}
+        for a in (await db.execute(select(CatalogoAdicional).where(CatalogoAdicional.activo == True))).scalars():  # noqa: E712
+            ad.setdefault(a.sku_base, []).append(f"{TIPOS_ADICIONAL.get(a.tipo, a.tipo)}: {a.nombre} x{a.cantidad_por_equipo} ({a.corresponde_a})")
+        cols = ["sku", "descripcion"] + list(CAMPOS_FLOAT) + list(CAMPOS_INT) + ["sat_codigo", "sat_desc"] + ["fuente_" + c for c in CAMPOS_COMPARA] + ["en_odoo", "empaques_adicionales"]
+        rows = []
+        for sku, i in items.items():
+            fu = _json(i.fuentes, {})
+            r = next((x for x in filas if x["sku"] == sku), None)
+            rows.append([sku, i.descripcion] + [getattr(i, c) for c in CAMPOS_FLOAT + CAMPOS_INT] + [i.sat_codigo, i.sat_desc]
+                        + [fu.get(c, "") for c in CAMPOS_COMPARA] + [("si" if (r and r["en_odoo"]) else "no"), " | ".join(ad.get(sku, []))])
+        return devolver(_csv(rows, cols))
+
+    raise HTTPException(400, "Tipo de exportación inválido.")
+
+
+
+@router.post("/gestion/importar-refacciones")
+async def importar_refacciones(archivo: UploadFile = File(...), simular: bool = False,
+                               db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Carga el archivo PESOS_Y_DIMENSIONES_REFACCIONES (hoja CONSOLIDADO): CODIGO, DESCRIPCION, PESO (gramos), LARGO, ANCHO, ALTO (cm).
+    Solo toca la base de esta plataforma, nunca Odoo. Peso se convierte de g a kg. Respeta lo editado aqui y lo que ya viene de Odoo.
+    simular=true devuelve el reporte sin guardar nada."""
+    _exigir_edicion(user)
+    import openpyxl
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(await archivo.read()), data_only=True)
+    except Exception:
+        raise HTTPException(422, "No se pudo leer el archivo. Sube el .xlsx de pesos y dimensiones.")
+    ws = wb["CONSOLIDADO"] if "CONSOLIDADO" in wb.sheetnames else wb[wb.sheetnames[0]]
+    filas_raw = list(ws.iter_rows(values_only=True))
+    ie = next((i for i, r in enumerate(filas_raw[:10]) if r and any(str(c or "").strip().upper() == "CODIGO" for c in r)), None)
+    if ie is None:
+        raise HTTPException(422, "No encuentro el encabezado con la columna CODIGO.")
+    enc = [re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", "", str(c or "")).strip().lower()) for c in filas_raw[ie]]
+    def col(*nombres):
+        for n in nombres:
+            if n in enc:
+                return enc.index(n)
+        return None
+    ic, idc, ip, il, ia, ih = col("codigo", "sku"), col("descripcion"), col("peso"), col("largo"), col("ancho"), col("alto")
+    if None in (ic, ip, il, ia, ih):
+        raise HTTPException(422, "Faltan columnas: se esperan CODIGO, PESO, LARGO, ANCHO y ALTO.")
+    filas, vistos, dup, avisos = [], set(), [], []
+    for r in filas_raw[ie + 1:]:
+        cod = str(r[ic] or "").strip().upper()
+        if not cod:
+            continue
+        if cod in vistos:
+            dup.append(cod)
+            continue
+        vistos.add(cod)
+        g, l, a, h = (_num(r[ip]), _num(r[il]), _num(r[ia]), _num(r[ih]))
+        kg = round(g / 1000.0, 4) if g else 0
+        m3 = round(l * a * h / 1_000_000, 6) if l and a and h else 0
+        if not (l and a and h):
+            avisos.append(f"{cod}: medidas incompletas")
+        if kg and kg < 0.005:
+            avisos.append(f"{cod}: peso muy bajo ({g} g)")
+        filas.append({"sku": cod, "descripcion": str(r[idc] or "").strip() if idc is not None else "", "peso_unit": kg,
+                      "lr_unit": l, "an_unit": a, "al_unit": h, "m3_unit": m3, "linea": "refaccion"})
+    if not filas:
+        raise HTTPException(422, "El archivo no trae filas con CODIGO.")
+    existentes = {x for (x,) in (await db.execute(select(CatalogoItem.sku).where(CatalogoItem.sku.in_([f["sku"] for f in filas])))).all()}
+    res = await _upsert_catalogo(db, filas, user["sub"], commit=not simular)
+    if simular:
+        await db.rollback()
+    return {"simulacion": simular, **res, "ya_existian": len(existentes), "duplicados_en_archivo": dup[:20],
+            "avisos": avisos[:40], "total_avisos": len(avisos), "nota": "Peso convertido de gramos a kg. Odoo no se modifica."}

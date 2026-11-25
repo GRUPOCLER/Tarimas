@@ -366,3 +366,147 @@ async def buscar_productos_venta(termino: str = "", limite: int = 50):
         "nombre":          p.get("name") or "",
         "existencia_odoo": p.get("qty_available", 0),
     } for p in productos if p.get("default_code")]
+
+
+# ── DATOS DE PRODUCTO PARA EL CATALOGO (solo lectura) ──────────────────────
+# Odoo cambia nombres de campos y modelos entre versiones (v17 -> v19), asi que se consulta con fields_get qué
+# existe realmente en esta base y se lee solo eso. Nada se escribe en Odoo.
+_fields_cache = {}
+
+
+async def _fields(model: str) -> dict:
+    if model in _fields_cache:
+        return _fields_cache[model]
+    try:
+        r = await _rpc(model, "fields_get", [], {"attributes": ["type", "string", "relation"]})
+    except Exception:
+        r = {}
+    _fields_cache[model] = r or {}
+    return _fields_cache[model]
+
+
+def reset_cache_campos():
+    _fields_cache.clear()
+
+
+async def _modelo_existe(nombre: str) -> bool:
+    try:
+        r = await _rpc("ir.model", "search_read", [[["model", "=", nombre]]], {"fields": ["model"], "limit": 1})
+        return bool(r)
+    except Exception:
+        return False
+
+
+# unidad de longitud -> factor para pasar a cm
+_A_CM = {"mm": 0.1, "millimeter": 0.1, "millimeters": 0.1, "cm": 1.0, "centimeter": 1.0, "centimeters": 1.0, "m": 100.0,
+         "meter": 100.0, "meters": 100.0, "in": 2.54, "inch": 2.54, "inches": 2.54, "ft": 30.48, "foot": 30.48, "feet": 30.48}
+
+
+def _factor_cm(nombre) -> float:
+    n = str(nombre or "").strip().lower()
+    return _A_CM.get(n, 1.0)
+
+
+_DIM_PROD = ("product_length", "product_width", "product_height")      # medidas en el producto (v18+) [VERIFICAR en v19]
+_DIM_PAQ = ("packaging_length", "width", "height")                       # medidas del tipo de paquete
+
+
+async def diagnostico_catalogo(muestra: str = "") -> dict:
+    """Qué campos y modelos relacionados con peso / medidas / empaques existen en ESTE Odoo."""
+    pf = await _fields("product.product")
+    campos_prod = {c: (c in pf) for c in ("weight", "volume", *_DIM_PROD, "dimensions_uom_id", "packaging_ids", "uom_ids")}
+    modelos = {m: await _modelo_existe(m) for m in ("product.packaging", "product.uom", "stock.package.type", "uom.uom")}
+    out = {"campos_producto": campos_prod, "modelos": modelos}
+    if modelos["product.packaging"]:
+        qf = await _fields("product.packaging")
+        out["campos_empaque"] = sorted(qf.keys())
+    if modelos["stock.package.type"]:
+        tf = await _fields("stock.package.type")
+        out["campos_tipo_paquete"] = sorted(c for c in tf if any(x in c for x in ("length", "width", "height", "weight", "uom", "name")))
+    if modelos["product.uom"]:
+        uf = await _fields("product.uom")
+        out["campos_product_uom"] = sorted(uf.keys())
+    if muestra.strip():
+        d = await leer_catalogo_odoo([muestra.strip().upper()])
+        out["muestra"] = d.get(muestra.strip().upper())
+    return out
+
+
+async def leer_catalogo_odoo(skus: list) -> dict:
+    """Devuelve {sku: {encontrado, odoo_id, peso_unit, m3_unit, lr_unit, an_unit, al_unit, cm_cant, cm_lr, cm_an, cm_al, empaques, ...}}
+    con medidas en cm, peso en kg y volumen en m3. Lo que Odoo no tiene viene en 0."""
+    skus = [s for s in dict.fromkeys(x.strip().upper() for x in skus if x) if s]
+    if not skus:
+        return {}
+    pf = await _fields("product.product")
+    campos = ["default_code", "name", "weight", "volume"] + [c for c in _DIM_PROD if c in pf]
+    if "dimensions_uom_id" in pf:
+        campos.append("dimensions_uom_id")
+    if "packaging_ids" in pf:
+        campos.append("packaging_ids")
+    # Odoo compara default_code sin distinguir si esta en mayusculas; se pide con ilike exacto via "in" sobre el valor original
+    productos = await _rpc("product.product", "search_read",
+                           [[["default_code", "in", skus + [s.lower() for s in skus]]]],
+                           {"fields": campos, "context": {"active_test": False}, "limit": len(skus) * 3})
+    # factor de unidad de medidas del producto
+    uom_ids = {p["dimensions_uom_id"][0] for p in productos if p.get("dimensions_uom_id")}
+    fact_uom = {}
+    if uom_ids:
+        try:
+            for u in await _rpc("uom.uom", "read", [list(uom_ids)], {"fields": ["name"]}):
+                fact_uom[u["id"]] = _factor_cm(u.get("name"))
+        except Exception:
+            pass
+
+    # empaques
+    paq_por_prod = {}
+    if await _modelo_existe("product.packaging"):
+        qf = await _fields("product.packaging")
+        ids = [i for p in productos for i in (p.get("packaging_ids") or [])]
+        if ids:
+            cq = [c for c in ("name", "qty", "product_id", "package_type_id") if c in qf]
+            paqs = await _rpc("product.packaging", "read", [ids], {"fields": cq, "context": {"active_test": False}})
+            tipo_ids = {q["package_type_id"][0] for q in paqs if q.get("package_type_id")}
+            tipos = {}
+            if tipo_ids and await _modelo_existe("stock.package.type"):
+                tf = await _fields("stock.package.type")
+                ct = ["name"] + [c for c in _DIM_PAQ if c in tf] + [c for c in ("length_uom_name", "max_weight") if c in tf]
+                for t in await _rpc("stock.package.type", "read", [list(tipo_ids)], {"fields": ct}):
+                    tipos[t["id"]] = t
+            for q in paqs:
+                t = tipos.get((q.get("package_type_id") or [None])[0], {}) if q.get("package_type_id") else {}
+                f = _factor_cm(t.get("length_uom_name"))
+                paq_por_prod.setdefault(q["product_id"][0], []).append({
+                    "id": q["id"], "nombre": q.get("name") or "", "qty": float(q.get("qty") or 0),
+                    "tipo": (t.get("name") if t else None),
+                    "lr": round((t.get("packaging_length") or 0) * f, 3), "an": round((t.get("width") or 0) * f, 3), "al": round((t.get("height") or 0) * f, 3),
+                })
+
+    marca = os.getenv("ODOO_EMPAQUE_MASTER", "master").strip().lower()
+    out = {}
+    for p in productos:
+        sku = (p.get("default_code") or "").strip().upper()
+        if not sku or sku in out:
+            continue
+        f = fact_uom.get((p.get("dimensions_uom_id") or [None])[0], 1.0)
+        d = {"encontrado": True, "odoo_id": p["id"], "nombre": p.get("name") or "",
+             "peso_unit": float(p.get("weight") or 0), "m3_unit": float(p.get("volume") or 0),
+             "lr_unit": round(float(p.get("product_length") or 0) * f, 3), "an_unit": round(float(p.get("product_width") or 0) * f, 3),
+             "al_unit": round(float(p.get("product_height") or 0) * f, 3),
+             "cm_cant": 0, "cm_lr": 0, "cm_an": 0, "cm_al": 0,
+             "dim_factor": f, "tiene_campos_dim": any(c in pf for c in _DIM_PROD)}
+        paqs = sorted([q for q in paq_por_prod.get(p["id"], []) if q["qty"] > 1], key=lambda q: q["qty"])
+        d["empaques"] = paq_por_prod.get(p["id"], [])
+        elegido = None
+        por_nombre = [q for q in paqs if marca and marca in (q["nombre"] or "").lower()]
+        if por_nombre:
+            elegido = por_nombre[0]
+        elif paqs:
+            elegido = paqs[0]
+            d["empaque_ambiguo"] = len(paqs) > 1
+        if elegido:
+            d.update({"cm_cant": int(round(elegido["qty"])), "cm_lr": elegido["lr"], "cm_an": elegido["an"], "cm_al": elegido["al"], "empaque_usado": elegido["nombre"]})
+        out[sku] = d
+    for s in skus:
+        out.setdefault(s, {"encontrado": False})
+    return out

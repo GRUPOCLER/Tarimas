@@ -14,6 +14,9 @@ async def lifespan(app: FastAPI):
     # Crear tablas al iniciar
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS valores_hoja TEXT"))
+        await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS linea VARCHAR(12)"))
+        await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS fuentes TEXT"))
         await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS campos_manuales TEXT"))
         await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS origen VARCHAR(12) DEFAULT 'hoja'"))
         await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS editado_por VARCHAR(50)"))
