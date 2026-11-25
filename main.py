@@ -14,6 +14,16 @@ async def lifespan(app: FastAPI):
     # Crear tablas al iniciar
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS campos_manuales TEXT"))
+        await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS origen VARCHAR(12) DEFAULT 'hoja'"))
+        await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS editado_por VARCHAR(50)"))
+        await conn.execute(text("ALTER TABLE catalogo ADD COLUMN IF NOT EXISTS editado_en TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE ordenes_venta ADD COLUMN IF NOT EXISTS asig_surtido VARCHAR(50)"))
+        await conn.execute(text("ALTER TABLE ordenes_venta ADD COLUMN IF NOT EXISTS asig_surtido_en TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE ordenes_venta ADD COLUMN IF NOT EXISTS asig_surtido_por VARCHAR(50)"))
+        await conn.execute(text("ALTER TABLE ordenes_venta ADD COLUMN IF NOT EXISTS asig_prep VARCHAR(50)"))
+        await conn.execute(text("ALTER TABLE ordenes_venta ADD COLUMN IF NOT EXISTS asig_prep_en TIMESTAMP"))
+        await conn.execute(text("ALTER TABLE ordenes_venta ADD COLUMN IF NOT EXISTS asig_prep_por VARCHAR(50)"))
         # Migracion ligera: agregar columnas nuevas si no existen
         await conn.execute(text(
             "ALTER TABLE productos ADD COLUMN IF NOT EXISTS cantidad_asignada INTEGER DEFAULT 0"

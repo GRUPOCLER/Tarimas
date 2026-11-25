@@ -10,17 +10,19 @@ y la duracion de cada etapa.
 """
 import io
 import json
-from datetime import datetime
+import math
+import re
+from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
 from pydantic import BaseModel
 from sqlalchemy import select, func, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models.models import (OrdenVenta, OVLinea, OVEvento, OVEscaneo, OVCaja, OVCajaItem,
+from models.models import (OVAdjunto, OVConfig, Usuario, UsuarioModulo, OrdenVenta, OVLinea, OVEvento, OVEscaneo, OVCaja, OVCajaItem,
                            CatalogoRefacciones, CatalogoItem)
 from parsers.sap_ov_refacciones import (parsear_ov, parsear_entrega, parsear_factura, norm_codigo)
 from services.permisos import acceso_modulo
@@ -52,6 +54,61 @@ def _iso(dt):
 def _exigir(user, *roles):
     if user.get("rol") not in roles:
         raise HTTPException(403, "Tu usuario no tiene permiso para esta acción.")
+
+
+# ───────────────────────── responsables por etapa ─────────────────────────
+ETAPAS_ASIG = {
+    "surtido": ("recibida", "en_surtido"),
+    "prep": ("recibida", "en_surtido", "surtida", "en_preparacion"),
+}
+_ART = {"surtido": "el surtido", "prep": "la preparación"}
+_NOM = {"surtido": "surtido", "prep": "preparación"}
+
+
+def _es_jefe(user) -> bool:
+    return user.get("rol") in ROLES_JEFE
+
+
+async def _exigir_asignacion(db) -> bool:
+    c = await db.get(OVConfig, "exigir_asignacion")
+    return bool(c and c.valor == "1")
+
+
+async def _nombres(db) -> dict:
+    r = await db.execute(select(Usuario.usuario, Usuario.nombre_display))
+    return {u.lower(): (n or u) for u, n in r.all()}
+
+
+async def _operadores(db) -> list:
+    """Usuarios activos con rol operador en Refacciones (a quienes se les puede asignar trabajo)."""
+    r = await db.execute(
+        select(Usuario.usuario, Usuario.nombre_display)
+        .join(UsuarioModulo, UsuarioModulo.usuario == Usuario.usuario)
+        .where(UsuarioModulo.modulo == "refacciones", UsuarioModulo.rol == "operador", Usuario.activo == True)  # noqa: E712
+        .order_by(Usuario.nombre_display, Usuario.usuario))
+    return [{"email": u.lower(), "usuario": u.lower(), "nombre": n or u} for u, n in r.all()]
+
+
+async def _puede_operar(db, ov, etapa: str, user) -> dict:
+    """Los jefes siempre; el resto solo si es el responsable (o si la OV no tiene y no se exige asignacion)."""
+    if _es_jefe(user):
+        return {"ok": True}
+    asig = (getattr(ov, "asig_" + etapa) or "").lower()
+    yo = (user.get("sub") or "").lower()
+    if asig:
+        if asig == yo:
+            return {"ok": True}
+        nom = (await _nombres(db)).get(asig, asig)
+        return {"ok": False, "motivo": f"Esta OV está asignada a {nom} para {_ART[etapa]}. Pide a un gerente que la reasigne."}
+    if await _exigir_asignacion(db):
+        return {"ok": False, "motivo": f"Esta OV todavía no tiene responsable de {_NOM[etapa]}. Un gerente debe asignarla."}
+    return {"ok": True}
+
+
+async def _exigir_operar(db, ov, etapa: str, user):
+    r = await _puede_operar(db, ov, etapa, user)
+    if not r["ok"]:
+        raise HTTPException(403, r["motivo"])
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -102,6 +159,8 @@ def _ov_ser(ov: OrdenVenta, lineas, ahora=None, ncajas=0) -> dict:
         "factura_fecha": ov.factura_fecha, "factura_en": _iso(ov.factura_en), "factura_por": ov.factura_por,
         "cajas": ncajas,
         "progreso": _prog(lineas),
+        "asig_surtido": ov.asig_surtido, "asig_surtido_en": _iso(ov.asig_surtido_en), "asig_surtido_por": ov.asig_surtido_por,
+        "asig_prep": ov.asig_prep, "asig_prep_en": _iso(ov.asig_prep_en), "asig_prep_por": ov.asig_prep_por,
     }
 
 
@@ -233,7 +292,7 @@ async def crear_ov(body: OVIn, db: AsyncSession = Depends(get_db), user: dict = 
     if ya:
         if ya.estatus not in ("recibida", "cancelada"):
             raise HTTPException(409, f"La OV {num} ya está en el sistema ({ya.estatus.replace('_', ' ')}). No se puede cargar de nuevo; si cambió en SAP, cancélala y vuelve a cargarla.")
-        for tabla in (OVEscaneo, OVEvento, OVLinea):
+        for tabla in (OVAdjunto, OVEscaneo, OVEvento, OVLinea):
             await db.execute(delete(tabla).where(tabla.ov_id == num))
         await db.execute(delete(OrdenVenta).where(OrdenVenta.id == num))
         await db.flush()
@@ -291,10 +350,11 @@ async def listar(ver: str = "activas", q: str = "", db: AsyncSession = Depends(g
         "estatus": ESTATUS,
         "conteo": conteo,
         "ovs": [_ov_ser(o, por.get(o.id, []), ahora, ncaj.get(o.id, 0)) for o in ovs],
+        "nombres": await _nombres(db),
     }
 
 
-async def _detalle(db, ov: OrdenVenta) -> dict:
+async def _detalle(db, ov: OrdenVenta, user=None) -> dict:
     ls = await _lineas(db, ov.id)
     cajas = list((await db.execute(select(OVCaja).where(OVCaja.ov_id == ov.id).order_by(OVCaja.numero))).scalars())
     items = []
@@ -340,6 +400,12 @@ async def _detalle(db, ov: OrdenVenta) -> dict:
     d["cajas_detalle"] = cajas_ser
     d["eventos"] = etapas
     d["categorias"] = _categorias(ls)
+    d["nombres"] = await _nombres(db)
+    d["exigir_asignacion"] = await _exigir_asignacion(db)
+    if user is not None:
+        if _es_jefe(user):
+            d["operadores"] = await _operadores(db)
+        d["operar"] = {"surtido": await _puede_operar(db, ov, "surtido", user), "prep": await _puede_operar(db, ov, "prep", user)}
     return d
 
 
@@ -366,7 +432,7 @@ async def _pesos(db, ls):
 
 @router.get("/{ov_id}")
 async def detalle(ov_id: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
-    return await _detalle(db, await _get_ov(db, ov_id))
+    return await _detalle(db, await _get_ov(db, ov_id), user)
 
 
 # ───────────────────────── surtido ─────────────────────────
@@ -390,6 +456,7 @@ async def surtir_escanear(ov_id: str, body: EscaneoIn, db: AsyncSession = Depend
     ov = await _get_ov(db, ov_id)
     if ov.estatus not in ("recibida", "en_surtido"):
         raise HTTPException(409, "Esta OV ya no está en surtido.")
+    await _exigir_operar(db, ov, "surtido", user)
     if body.cantidad < 1:
         raise HTTPException(400, "La cantidad debe ser al menos 1.")
     ls = await _lineas(db, ov_id)
@@ -416,6 +483,7 @@ async def surtir_linea(ov_id: str, lid: int, body: CantidadIn, db: AsyncSession 
     ov = await _get_ov(db, ov_id)
     if ov.estatus not in ("recibida", "en_surtido"):
         raise HTTPException(409, "Esta OV ya no está en surtido.")
+    await _exigir_operar(db, ov, "surtido", user)
     ls = await _lineas(db, ov_id)
     l = next((x for x in ls if x.id == lid), None)
     if not l:
@@ -443,6 +511,7 @@ async def surtido_terminar(ov_id: str, body: CantidadIn = None, db: AsyncSession
     ov = await _get_ov(db, ov_id)
     if ov.estatus not in ("recibida", "en_surtido"):
         raise HTTPException(409, "Esta OV ya no está en surtido.")
+    await _exigir_operar(db, ov, "surtido", user)
     ls = await _lineas(db, ov_id)
     falt = [l for l in ls if (l.surtida or 0) < (l.cantidad or 0)]
     if falt:
@@ -471,6 +540,8 @@ async def _caja(db, ov_id, cid) -> OVCaja:
 
 
 async def _asegurar_prep(db, ov, user):
+    if ov.estatus in ("surtida", "en_preparacion"):
+        await _exigir_operar(db, ov, "prep", user)
     if ov.estatus == "surtida":
         await _cambiar(db, ov, "en_preparacion", user, "Inicio de preparación")
     elif ov.estatus != "en_preparacion":
@@ -515,6 +586,7 @@ async def _meter(db, ov, c, l, q, user, metodo):
 @router.post("/{ov_id}/preparacion/cajas/{cid}/escanear")
 async def caja_escanear(ov_id: str, cid: int, body: EscaneoIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     ov = await _get_ov(db, ov_id)
+    await _exigir_operar(db, ov, "prep", user)
     if ov.estatus != "en_preparacion":
         raise HTTPException(409, "La OV no está en preparación.")
     c = await _caja(db, ov_id, cid)
@@ -530,12 +602,13 @@ async def caja_escanear(ov_id: str, cid: int, body: EscaneoIn, db: AsyncSession 
         raise HTTPException(409, "De ese producto ya no quedan piezas por empacar.")
     await _meter(db, ov, c, l, body.cantidad, user, "scan")
     await db.commit()
-    return await _detalle(db, ov)
+    return await _detalle(db, ov, user)
 
 
 @router.post("/{ov_id}/preparacion/cajas/{cid}/quitar")
 async def caja_quitar(ov_id: str, cid: int, linea_id: int, cantidad: int = 1, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     ov = await _get_ov(db, ov_id)
+    await _exigir_operar(db, ov, "prep", user)
     c = await _caja(db, ov_id, cid)
     if c.estatus != "abierta":
         raise HTTPException(409, "Esa caja ya está cerrada.")
@@ -547,7 +620,7 @@ async def caja_quitar(ov_id: str, cid: int, linea_id: int, cantidad: int = 1, db
     l.empacada = max(0, (l.empacada or 0) - cantidad)
     db.add(OVEscaneo(ov_id=ov_id, linea_id=linea_id, caja_id=cid, etapa="preparacion", cantidad=-cantidad, codigo=l.codigo, metodo="manual", usuario=user["sub"]))
     await db.commit()
-    return await _detalle(db, ov)
+    return await _detalle(db, ov, user)
 
 
 class CerrarCajaIn(BaseModel):
@@ -557,6 +630,7 @@ class CerrarCajaIn(BaseModel):
 @router.post("/{ov_id}/preparacion/cajas/{cid}/cerrar")
 async def caja_cerrar(ov_id: str, cid: int, body: CerrarCajaIn = None, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     ov = await _get_ov(db, ov_id)
+    await _exigir_operar(db, ov, "prep", user)
     c = await _caja(db, ov_id, cid)
     if c.estatus != "abierta":
         raise HTTPException(409, "Esa caja ya está cerrada.")
@@ -572,7 +646,7 @@ async def caja_cerrar(ov_id: str, cid: int, body: CerrarCajaIn = None, db: Async
     if all((l.empacada or 0) >= (l.surtida or 0) for l in ls):
         await _cambiar(db, ov, "preparada", user, "Todo lo surtido quedó en cajas")
     await db.commit()
-    return await _detalle(db, ov)
+    return await _detalle(db, ov, user)
 
 
 @router.post("/{ov_id}/preparacion/cajas/{cid}/reabrir")
@@ -589,13 +663,14 @@ async def caja_reabrir(ov_id: str, cid: int, db: AsyncSession = Depends(get_db),
     if ov.estatus == "preparada":
         await _cambiar(db, ov, "en_preparacion", user, f"Reapertura de la caja {c.numero}")
     await db.commit()
-    return await _detalle(db, ov)
+    return await _detalle(db, ov, user)
 
 
 @router.post("/{ov_id}/preparacion/terminar")
 async def prep_terminar(ov_id: str, body: CantidadIn = None, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     """Termina la preparacion aunque queden piezas surtidas sin empacar (solo gerente/admin, con motivo)."""
     ov = await _get_ov(db, ov_id)
+    await _exigir_operar(db, ov, "prep", user)
     if ov.estatus != "en_preparacion":
         raise HTTPException(409, "La OV no está en preparación.")
     if (await db.execute(select(func.count()).select_from(OVCaja).where(OVCaja.ov_id == ov_id, OVCaja.estatus == "abierta"))).scalar():
@@ -785,12 +860,18 @@ async def entrega_registrar(ov_id: str, folio: str = Form(""), confirmar_diferen
 @router.post("/{ov_id}/factura")
 async def factura_registrar(ov_id: str, folio: str = Form(""), confirmar: bool = Form(False),
                             archivo: Optional[UploadFile] = File(None),
+                            xml: Optional[UploadFile] = File(None),
                             db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     _exigir(user, *ROLES_FACTURA)
     ov = await _get_ov(db, ov_id)
     if ov.estatus != "entregada_sap":
         raise HTTPException(409, "La factura se registra cuando la entrega de SAP ya está capturada.")
     uuid_, fecha = None, None
+    cf = None
+    if xml is not None and xml.filename:
+        cf = _leer_cfdi(await xml.read())
+        if not cf["uuid"]:
+            raise HTTPException(400, "El XML no trae el folio fiscal (UUID); revisa que sea una factura timbrada.")
     if archivo is not None and archivo.filename:
         try:
             fa = parsear_factura(await archivo.read())
@@ -801,6 +882,8 @@ async def factura_registrar(ov_id: str, folio: str = Form(""), confirmar: bool =
         if folio.strip() and folio.strip() != fa["folio"]:
             raise HTTPException(400, f"El folio escrito ({folio.strip()}) no coincide con el del PDF ({fa['folio']}).")
         probl = []
+        if cf and fa.get("uuid") and str(fa["uuid"]).upper() != cf["uuid"]:
+            probl.append(f"el folio fiscal del XML ({cf['uuid']}) no es el del PDF ({str(fa['uuid']).upper()})")
         if fa["num_ov"] and fa["num_ov"] != ov.num_ov:
             probl.append(f"la factura dice OV {fa['num_ov']} y esta es la {ov.num_ov}")
         if fa["num_entrega"] and fa["num_entrega"] != ov.entrega_folio:
@@ -808,9 +891,17 @@ async def factura_registrar(ov_id: str, folio: str = Form(""), confirmar: bool =
         if probl and not confirmar:
             raise HTTPException(409, "La factura no coincide: " + "; ".join(probl) + ".")
         folio, uuid_, fecha = fa["folio"], fa["uuid"], fa["fecha"]
+    elif cf and not folio.strip():
+        folio = (cf["serie"] + cf["folio"]).strip()
+    if cf:
+        uuid_ = cf["uuid"]
+        fecha = fecha or (cf["fecha"] or "")[:10]
+        dup = (await db.execute(select(OrdenVenta.num_ov).where(OrdenVenta.factura_uuid == uuid_, OrdenVenta.id != ov.id))).scalars().first()
+        if dup:
+            raise HTTPException(409, f"Ese folio fiscal ya está registrado en la OV {dup}.")
     folio = folio.strip()
     if not folio:
-        raise HTTPException(400, "Escribe el folio de la factura o adjunta el PDF.")
+        raise HTTPException(400, "Escribe el folio de la factura o adjunta el PDF o el XML.")
     ov.factura_folio, ov.factura_uuid, ov.factura_fecha = folio, uuid_, fecha
     ov.factura_en = datetime.utcnow()
     ov.factura_por = user["sub"]
@@ -830,5 +921,284 @@ async def cancelar(ov_id: str, body: CantidadIn, db: AsyncSession = Depends(get_
     if len(motivo) < 3:
         raise HTTPException(400, "Escribe el motivo de la cancelación.")
     await _cambiar(db, ov, "cancelada", user, motivo)
+    await db.commit()
+    return {"ok": True}
+
+
+# ───────────────────────── CFDI (XML de factura) ─────────────────────────
+def _leer_cfdi(datos: bytes) -> dict:
+    import xml.etree.ElementTree as ET
+    txt = datos.decode("utf-8-sig", errors="replace")
+    if "<!DOCTYPE" in txt.upper() or "<!ENTITY" in txt.upper():
+        raise HTTPException(400, "El XML no es válido.")
+    try:
+        raiz = ET.fromstring(txt)
+    except ET.ParseError:
+        raise HTTPException(400, "El XML está dañado o no es un XML válido.")
+
+    def busca(nombre):
+        for el in raiz.iter():
+            if el.tag.split("}")[-1] == nombre:
+                return el
+        return None
+    comp = raiz if raiz.tag.split("}")[-1] == "Comprobante" else busca("Comprobante")
+    if comp is None:
+        raise HTTPException(400, "El archivo no parece un XML de factura (CFDI).")
+    tim, em, re_ = busca("TimbreFiscalDigital"), busca("Emisor"), busca("Receptor")
+    a = lambda el, k: (el.get(k) or "").strip() if el is not None else ""
+    try:
+        total = float(a(comp, "Total") or 0)
+    except ValueError:
+        total = 0.0
+    return {"uuid": a(tim, "UUID").upper(), "serie": a(comp, "Serie"), "folio": a(comp, "Folio"), "fecha": a(comp, "Fecha"),
+            "total": total, "moneda": a(comp, "Moneda"), "rfc_emisor": a(em, "Rfc"), "nombre_emisor": a(em, "Nombre"),
+            "rfc_receptor": a(re_, "Rfc"), "nombre_receptor": a(re_, "Nombre")}
+
+
+# ───────────────────────── asignacion de responsables ─────────────────────────
+class AsignarIn(BaseModel):
+    etapa: str
+    usuario: Optional[str] = ""
+
+
+class ExigirIn(BaseModel):
+    exigir: bool
+
+
+@router.post("/{ov_id}/asignar")
+async def asignar(ov_id: str, body: AsignarIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir(user, *ROLES_JEFE)
+    if body.etapa not in ETAPAS_ASIG:
+        raise HTTPException(400, "Etapa inválida.")
+    ov = await _get_ov(db, ov_id)
+    if ov.estatus not in ETAPAS_ASIG[body.etapa]:
+        raise HTTPException(409, f'Ya no se puede cambiar el responsable de {_NOM[body.etapa]}: la OV está en "{ov.estatus.replace("_", " ")}".')
+    u = (body.usuario or "").strip().lower()
+    if u:
+        if u not in {o["usuario"] for o in await _operadores(db)}:
+            raise HTTPException(400, "Ese usuario no está activo o no es operador de Refacciones.")
+    e = body.etapa
+    setattr(ov, f"asig_{e}", u or None)
+    setattr(ov, f"asig_{e}_en", datetime.utcnow() if u else None)
+    setattr(ov, f"asig_{e}_por", user["sub"] if u else None)
+    await db.commit()
+    return {"ok": True, "ov": _ov_ser(ov, await _lineas(db, ov_id))}
+
+
+@router.get("/asignacion/tablero")
+async def asig_tablero(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir(user, *ROLES_JEFE)
+    ovs = list((await db.execute(select(OrdenVenta).where(OrdenVenta.estatus.in_(ETAPAS_ASIG["prep"])).order_by(OrdenVenta.creado_en))).scalars())
+    ids = [o.id for o in ovs]
+    por = {}
+    if ids:
+        for l in (await db.execute(select(OVLinea).where(OVLinea.ov_id.in_(ids)))).scalars():
+            por.setdefault(l.ov_id, []).append(l)
+    ahora = datetime.utcnow()
+    return {"operadores": await _operadores(db), "ovs": [_ov_ser(o, por.get(o.id, []), ahora) for o in ovs],
+            "exigir": await _exigir_asignacion(db), "nombres": await _nombres(db)}
+
+
+@router.post("/asignacion/config")
+async def asig_config(body: ExigirIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir(user, "admin")
+    c = await db.get(OVConfig, "exigir_asignacion")
+    if c:
+        c.valor = "1" if body.exigir else "0"
+    else:
+        db.add(OVConfig(clave="exigir_asignacion", valor="1" if body.exigir else "0"))
+    await db.commit()
+    return {"ok": True, "exigir": body.exigir}
+
+
+# ───────────────────────── KPI de tiempos ─────────────────────────
+KPI_ETAPAS = [
+    ("recibida", "Espera de surtido"), ("en_surtido", "Surtido"), ("surtida", "Espera de preparación"),
+    ("en_preparacion", "Preparación"), ("preparada", "Espera de entrega SAP"), ("entregada_sap", "Espera de factura"),
+]
+
+
+def _pct(v, p):
+    if not v:
+        return None
+    a = sorted(v)
+    return a[min(len(a) - 1, max(0, math.ceil(p * len(a)) - 1))]
+
+
+def _prom(v):
+    return round(sum(v) / len(v)) if v else None
+
+
+@router.get("/kpi/tiempos")
+async def kpi_tiempos(desde: str = "", hasta: str = "", db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Tiempos por etapa y por responsable de las OV creadas entre desde y hasta (aaaa-mm-dd, hora de Ciudad de Mexico)."""
+    _exigir(user, *ROLES_JEFE)
+    import re
+    from zoneinfo import ZoneInfo
+    mx, utc = ZoneInfo("America/Mexico_City"), ZoneInfo("UTC")
+    hoy = datetime.now(mx).date()
+    ok = lambda x: bool(re.match(r"^\d{4}-\d{2}-\d{2}$", x or ""))
+    desde = desde if ok(desde) else (hoy - timedelta(days=30)).isoformat()
+    hasta = hasta if ok(hasta) else hoy.isoformat()
+    try:
+        t0 = datetime.fromisoformat(desde + "T00:00:00").replace(tzinfo=mx).astimezone(utc).replace(tzinfo=None)
+        t1 = datetime.fromisoformat(hasta + "T23:59:59").replace(tzinfo=mx).astimezone(utc).replace(tzinfo=None)
+    except ValueError:
+        raise HTTPException(400, "Fechas inválidas.")
+    ovs = list((await db.execute(select(OrdenVenta).where(OrdenVenta.creado_en >= t0, OrdenVenta.creado_en <= t1, OrdenVenta.estatus != "cancelada"))).scalars())
+    ids = [o.id for o in ovs]
+    ev_por, ls_por, ncaj = {}, {}, {}
+    if ids:
+        for e in (await db.execute(select(OVEvento).where(OVEvento.ov_id.in_(ids)).order_by(OVEvento.en, OVEvento.id))).scalars():
+            ev_por.setdefault(e.ov_id, []).append(e)
+        for l in (await db.execute(select(OVLinea).where(OVLinea.ov_id.in_(ids)))).scalars():
+            ls_por.setdefault(l.ov_id, []).append(l)
+        for oid, n in (await db.execute(select(OVCaja.ov_id, func.count()).where(OVCaja.ov_id.in_(ids)).group_by(OVCaja.ov_id))).all():
+            ncaj[oid] = n
+    nombres = await _nombres(db)
+    por_etapa = {k: [] for k, _ in KPI_ETAPAS}
+    ciclos, detalle = [], []
+    resp = {"surtido": {}, "prep": {}}
+    for o in ovs:
+        evs = ev_por.get(o.id, [])
+        seg, primero = {}, {}
+        for i, e in enumerate(evs):
+            primero.setdefault(e.estatus, e)
+            if i + 1 >= len(evs):
+                continue                      # intervalo aun abierto: no cuenta
+            d = (evs[i + 1].en - e.en).total_seconds()
+            if d >= 0:
+                seg[e.estatus] = seg.get(e.estatus, 0) + d
+        prog = _prog(ls_por.get(o.id, []))
+        fila = {"id": o.id, "num_ov": o.num_ov, "cliente": o.cliente, "estatus": o.estatus, "piezas": prog["piezas"],
+                "surtidas": prog["surtidas"], "empacadas": prog["empacadas"], "cajas": ncaj.get(o.id, 0), "seg": {}}
+        for k, _ in KPI_ETAPAS:
+            if k not in seg:
+                fila["seg"][k] = None
+                continue
+            fila["seg"][k] = round(seg[k])
+            por_etapa[k].append(seg[k])
+        fin = primero.get("facturada")
+        fila["ciclo_seg"] = round((fin.en - o.creado_en).total_seconds()) if fin and o.creado_en else None
+        if fila["ciclo_seg"] is not None:
+            ciclos.append(fila["ciclo_seg"])
+        for etapa, est, campo in (("surtido", "en_surtido", "surtidas"), ("prep", "en_preparacion", "empacadas")):
+            ini = primero.get(est)
+            asig = (getattr(o, "asig_" + etapa) or "").lower()
+            ejec = (ini.por or "").lower() if ini else ""
+            quien = asig or ejec
+            asig_en = getattr(o, f"asig_{etapa}_en")
+            arr = None
+            if asig and ini and asig_en:
+                a = (ini.en - asig_en).total_seconds()
+                arr = round(a) if a >= 0 else None
+            fila[etapa] = {"asignado": asig or None, "ejecuto": ejec or None, "responsable": quien or None, "arranque_seg": arr}
+            if not quien or est not in seg:
+                continue
+            r = resp[etapa].setdefault(quien, {"email": quien, "nombre": nombres.get(quien, quien), "ovs": 0, "piezas": 0, "seg": 0, "en_tiempo": 0, "arranques": []})
+            r["ovs"] += 1
+            r["piezas"] += prog[campo]
+            r["seg"] += seg[est]
+            if seg[est] <= (_UMBRAL.get(est) or 1e9) * 3600:
+                r["en_tiempo"] += 1
+            if arr is not None:
+                r["arranques"].append(arr)
+        detalle.append(fila)
+
+    etapas = []
+    for k, nom in KPI_ETAPAS:
+        v, um = por_etapa[k], _UMBRAL.get(k)
+        etapas.append({"id": k, "nombre": nom, "n": len(v), "prom_seg": _prom(v), "mediana_seg": _pct(v, 0.5), "p90_seg": _pct(v, 0.9),
+                       "max_seg": round(max(v)) if v else None, "umbral_horas": um,
+                       "pct_en_tiempo": round(100 * sum(1 for x in v if x <= um * 3600) / len(v)) if v and um else None})
+
+    def lista(o):
+        out = []
+        for r in o.values():
+            out.append({"email": r["email"], "nombre": r["nombre"], "ovs": r["ovs"], "piezas": r["piezas"], "seg_total": round(r["seg"]),
+                        "prom_seg": round(r["seg"] / r["ovs"]) if r["ovs"] else None,
+                        "piezas_hora": round(10 * r["piezas"] / (r["seg"] / 3600)) / 10 if r["seg"] > 0 else None,
+                        "pct_en_tiempo": round(100 * r["en_tiempo"] / r["ovs"]) if r["ovs"] else None,
+                        "arranque_prom_seg": _prom(r["arranques"])})
+        return sorted(out, key=lambda x: -x["ovs"])
+    detalle.sort(key=lambda f: str(f["id"]), reverse=True)
+    return {"desde": desde, "hasta": hasta, "total_ovs": len(ovs), "facturadas": len(ciclos), "ciclo_prom_seg": _prom(ciclos),
+            "ciclo_mediana_seg": _pct(ciclos, 0.5), "etapas": etapas,
+            "responsables": {"surtido": lista(resp["surtido"]), "prep": lista(resp["prep"])}, "detalle": detalle[:300], "nombres": nombres}
+
+
+# ───────────────────────── adjuntos (PDF / XML) ─────────────────────────
+ADJUNTOS = {
+    "ov_pdf": ("OV (PDF)", ROLES_CARGA),
+    "entrega_pdf": ("Entrega SAP (PDF)", ROLES_CARGA),
+    "factura_pdf": ("Factura (PDF)", ROLES_FACTURA),
+    "factura_xml": ("Factura (XML)", ROLES_FACTURA),
+}
+MAX_ADJUNTO = 9 * 1024 * 1024
+
+
+def _adj_ser(a: OVAdjunto) -> dict:
+    return {"id": a.id, "ov_id": a.ov_id, "tipo": a.tipo, "tipo_nombre": ADJUNTOS.get(a.tipo, (a.tipo,))[0], "nombre": a.nombre,
+            "mime": a.mime, "tam": a.tam or 0, "subido_en": _iso(a.subido_en), "subido_por": a.subido_por}
+
+
+@router.get("/{ov_id}/adjuntos")
+async def adj_listar(ov_id: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    await _get_ov(db, ov_id)
+    r = await db.execute(select(OVAdjunto).where(OVAdjunto.ov_id == ov_id).order_by(OVAdjunto.subido_en.desc()))
+    return [_adj_ser(a) for a in r.scalars()]
+
+
+@router.post("/{ov_id}/adjuntos")
+async def adj_subir(ov_id: str, tipo: str = Form(...), archivo: UploadFile = File(...),
+                    db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Un archivo nuevo del mismo tipo reemplaza al anterior."""
+    cfg = ADJUNTOS.get(tipo)
+    if not cfg:
+        raise HTTPException(400, "Tipo de archivo inválido.")
+    _exigir(user, *cfg[1])
+    ov = await _get_ov(db, ov_id)
+    if tipo.startswith("factura") and ov.estatus not in ("entregada_sap", "facturada"):
+        raise HTTPException(409, "La factura se adjunta cuando la entrega de SAP ya está capturada.")
+    datos = await archivo.read()
+    if not datos:
+        raise HTTPException(400, "El archivo está vacío.")
+    if len(datos) > MAX_ADJUNTO:
+        raise HTTPException(413, "El archivo pesa más de 9 MB.")
+    es_pdf = tipo.endswith("_pdf")
+    if es_pdf:
+        if not datos.lstrip()[:5].startswith(b"%PDF"):
+            raise HTTPException(400, "El archivo no es un PDF.")
+        mime = "application/pdf"
+    else:
+        cf = _leer_cfdi(datos)
+        mime = "text/xml"
+        if tipo == "factura_xml" and not ov.factura_uuid and ov.estatus == "facturada" and cf["uuid"]:
+            ov.factura_uuid = cf["uuid"]
+    nombre = re.sub(r'[\\/:*?"<>|]+', "_", archivo.filename or (tipo + (".pdf" if es_pdf else ".xml")))[:120]
+    await db.execute(delete(OVAdjunto).where(OVAdjunto.ov_id == ov_id, OVAdjunto.tipo == tipo))
+    a = OVAdjunto(ov_id=ov_id, tipo=tipo, nombre=nombre, mime=mime, tam=len(datos), subido_por=user["sub"], contenido=datos)
+    db.add(a)
+    await db.commit()
+    await db.refresh(a)
+    return _adj_ser(a)
+
+
+@router.get("/adjuntos/{adj_id}/contenido")
+async def adj_leer(adj_id: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    a = await db.get(OVAdjunto, adj_id)
+    if not a:
+        raise HTTPException(404, "No existe ese archivo.")
+    return Response(content=a.contenido or b"", media_type=a.mime or "application/octet-stream",
+                    headers={"Cache-Control": "private, max-age=300"})
+
+
+@router.delete("/adjuntos/{adj_id}")
+async def adj_borrar(adj_id: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir(user, *ROLES_JEFE)
+    a = await db.get(OVAdjunto, adj_id)
+    if not a:
+        raise HTTPException(404, "No existe ese archivo.")
+    await db.delete(a)
     await db.commit()
     return {"ok": True}

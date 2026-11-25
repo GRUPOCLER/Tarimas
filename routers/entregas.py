@@ -430,8 +430,44 @@ async def crear_entrega(
             unidad             = p.unidad,
             es_extension       = p.es_extension
         ))
+    # Empaques adicionales declarados en el catalogo (extension / adicional / accesorio): se crean solos
+    creados = await _crear_adicionales_catalogo(db, id_e, body.productos)
     await db.commit()
-    return {"ok": True, "id_entrega": id_e, "total": len(body.productos)}
+    return {"ok": True, "id_entrega": id_e, "total": len(body.productos), "adicionales_creados": creados}
+
+
+async def _crear_adicionales_catalogo(db, id_e: str, productos) -> list:
+    """Por cada producto cuyo SKU tenga empaques adicionales activos en el catalogo, agrega esas lineas a la entrega
+    (misma mecanica que la extension manual: clave 'SKU (EXTn)', pendiente por asignar a una tarima)."""
+    from models.models import CatalogoAdicional
+    bases = {_sku_base(p.clave) for p in productos if p.clave and not p.es_extension}
+    if not bases:
+        return []
+    r = await db.execute(select(CatalogoAdicional).where(CatalogoAdicional.sku_base.in_(list(bases)), CatalogoAdicional.activo == True)  # noqa: E712
+                         .order_by(CatalogoAdicional.creado_en))
+    por_sku = {}
+    for a in r.scalars():
+        por_sku.setdefault(a.sku_base, []).append(a)
+    # si la entrega ya trae sus propias extensiones de un SKU, no se duplican
+    ya_traen = {_sku_base(p.clave) for p in productos if p.clave and p.es_extension}
+    creados = []
+    for i, p in enumerate(productos, 1):
+        if not p.clave or p.es_extension:
+            continue
+        base = _sku_base(p.clave)
+        if base in ya_traen:
+            continue
+        id_p = _gen_id_prod(id_e, i)
+        for n, a in enumerate(por_sku.get(base, []), 1):
+            cant = max(1, int(p.cantidad_total or 0) * (a.cantidad_por_equipo or 1))
+            clave = f"{p.clave.strip().upper()} (EXT{n})"
+            db.add(Producto(
+                id_producto=f"{id_p}-EXT{n}", id_entrega=id_e, clave=clave,
+                descripcion=f"{p.descripcion or ''} - {a.nombre}",
+                cantidad_total=cant, cantidad_asignada=0, cantidad_pendiente=cant,
+                unidad=p.unidad, es_extension=True))
+            creados.append({"clave": clave, "nombre": a.nombre, "tipo": a.tipo, "cantidad": cant, "corresponde_a": a.corresponde_a})
+    return creados
 
 # ── PROCESAR PDF ──────────────────────────────────────────────
 @router.post("/pdf")

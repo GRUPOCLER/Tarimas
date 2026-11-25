@@ -1,12 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete, or_
+from pydantic import BaseModel
 from typing import Optional
 from urllib.parse import quote
-import io, os, csv, re, httpx
+import io, os, csv, re, json, httpx
 
 from database import get_db
-from models.models import CatalogoItem
+from models.models import CatalogoItem, CatalogoHistorial, CatalogoAdicional
 from services.auth import verificar_token
 
 router = APIRouter()
@@ -101,11 +102,35 @@ def _filas_desde_gviz_json(texto: str) -> list:
         filas.append(dict(zip(enc, vals)))
     return filas
 
-async def _upsert_catalogo(db: AsyncSession, filas: list) -> dict:
-    """Recibe una lista de dicts ya normalizados (claves como 'sku', 'cm_cant', etc.)
-    y hace insert/update en la tabla catalogo. Compartido entre /importar y
-    /sincronizar-drive para no duplicar la logica."""
-    insertados, actualizados, omitidos = 0, 0, 0
+CAMPOS_TXT = ("descripcion", "sat_codigo", "sat_desc")
+CAMPOS_FLOAT = ("peso_unit", "lr_unit", "an_unit", "al_unit", "m3_unit", "cm_peso", "cm_lr", "cm_an", "cm_al", "cm_m3")
+CAMPOS_INT = ("cm_cant",)
+CAMPOS_EDITABLES = CAMPOS_TXT + CAMPOS_FLOAT + CAMPOS_INT
+
+
+def _manuales(item) -> set:
+    try:
+        return set(json.loads(item.campos_manuales or "[]"))
+    except Exception:
+        return set()
+
+
+def _txt(v):
+    return "" if v is None else (str(round(v, 6)).rstrip("0").rstrip(".") if isinstance(v, float) else str(v))
+
+
+def _igual(a, b) -> bool:
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a or 0) - float(b or 0)) < 1e-9
+    return (a or "") == (b or "")
+
+
+async def _upsert_catalogo(db: AsyncSession, filas: list, usuario: str = "sistema") -> dict:
+    """Recibe una lista de dicts ya normalizados (claves como 'sku', 'cm_cant', etc.) y hace insert/update en la
+    tabla catalogo. Los campos que se editaron en la plataforma NO se pisan, y cada cambio queda en el historial.
+    Compartido entre /importar y /sincronizar-drive."""
+    insertados, actualizados, omitidos, protegidos = 0, 0, 0, 0
+    cambios = 0
     for fila in filas:
         sku = str(fila.get("sku") or "").strip().upper()
         if not sku:
@@ -116,29 +141,46 @@ async def _upsert_catalogo(db: AsyncSession, filas: list) -> dict:
         item = existente.scalar_one_or_none()
         es_nuevo = item is None
         if es_nuevo:
-            item = CatalogoItem(sku=sku)
+            item = CatalogoItem(sku=sku, origen="hoja")
             db.add(item)
 
-        item.descripcion = str(fila.get("descripcion") or (item.descripcion or ""))
-        item.peso_unit   = _num(fila.get("peso_unit"))
-        item.lr_unit     = _num(fila.get("lr_unit"))
-        item.an_unit     = _num(fila.get("an_unit"))
-        item.al_unit     = _num(fila.get("al_unit"))
-        item.m3_unit     = _num(fila.get("m3_unit"))
-        item.cm_cant     = _num(fila.get("cm_cant"), es_entero=True)
-        item.cm_peso     = _num(fila.get("cm_peso"))
-        item.cm_lr       = _num(fila.get("cm_lr"))
-        item.cm_an       = _num(fila.get("cm_an"))
-        item.cm_al       = _num(fila.get("cm_al"))
-        item.cm_m3       = _num(fila.get("cm_m3"))
-        item.sat_codigo  = str(fila.get("sat_codigo") or "") or None
-        item.sat_desc    = str(fila.get("sat_desc") or "") or None
+        nuevos = {
+            "descripcion": str(fila.get("descripcion") or (item.descripcion or "")),
+            "sat_codigo": str(fila.get("sat_codigo") or "") or None,
+            "sat_desc": str(fila.get("sat_desc") or "") or None,
+        }
+        for c in CAMPOS_FLOAT:
+            nuevos[c] = _num(fila.get(c))
+        for c in CAMPOS_INT:
+            nuevos[c] = _num(fila.get(c), es_entero=True)
 
-        if es_nuevo: insertados += 1
-        else: actualizados += 1
+        manual = set() if es_nuevo else _manuales(item)
+        hubo = False
+        for campo, val in nuevos.items():
+            if campo in manual:
+                if not _igual(getattr(item, campo), val):
+                    protegidos += 1
+                continue
+            if es_nuevo:
+                setattr(item, campo, val)
+                continue
+            ant = getattr(item, campo)
+            if not _igual(ant, val):
+                db.add(CatalogoHistorial(sku=sku, campo=campo, valor_anterior=_txt(ant), valor_nuevo=_txt(val),
+                                         origen="hoja", motivo="Sincronizacion / importacion", usuario=usuario))
+                setattr(item, campo, val)
+                hubo = True
+                cambios += 1
+        if es_nuevo:
+            db.add(CatalogoHistorial(sku=sku, campo="(alta)", valor_nuevo=nuevos["descripcion"], origen="hoja",
+                                     motivo="Alta desde la hoja", usuario=usuario))
+            insertados += 1
+        else:
+            actualizados += 1
 
     await db.commit()
-    return {"insertados": insertados, "actualizados": actualizados, "omitidos": omitidos, "total_filas": len(filas)}
+    return {"insertados": insertados, "actualizados": actualizados, "omitidos": omitidos, "total_filas": len(filas),
+            "cambios_registrados": cambios, "campos_protegidos": protegidos}
 
 @router.get("/")
 async def listar_catalogo(
@@ -232,7 +274,7 @@ async def importar_catalogo(
         for fila in filas_raw[1:]:
             filas.append(dict(zip(encabezado, fila)))
 
-    resultado = await _upsert_catalogo(db, filas)
+    resultado = await _upsert_catalogo(db, filas, user.get("sub") or "admin")
     resultado["ok"] = True
     resultado["hoja_usada"] = hoja_usada
     return resultado
@@ -281,8 +323,333 @@ async def sincronizar_desde_drive(db: AsyncSession = Depends(get_db), user: dict
         encabezado = [_normalizar_col(c) for c in filas_raw[0]]
         filas, fuente = [dict(zip(encabezado, f)) for f in filas_raw[1:]], "google_sheets_csv"
 
-    resultado = await _upsert_catalogo(db, filas)
+    resultado = await _upsert_catalogo(db, filas, user.get("sub") or "admin")
     resultado["ok"] = True
     resultado["fuente"] = fuente
     resultado["hoja_usada"] = GOOGLE_SHEET_CATALOGO_HOJA
     return resultado
+
+
+# ═════════════════════ GESTION DEL CATALOGO (edicion local, historial, empaques adicionales) ═════════════════════
+# Todo lo que se edita aqui se queda en esta base de datos; nada se escribe en Odoo ni en la hoja.
+TIPOS_ADICIONAL = {"extension": "Extensión", "adicional": "Adicional", "accesorio": "Accesorio"}
+ETIQ_CAMPO = {
+    "descripcion": "Descripción", "peso_unit": "Peso unitario (kg)", "lr_unit": "Largo (cm)", "an_unit": "Ancho (cm)",
+    "al_unit": "Alto (cm)", "m3_unit": "Volumen (m3)", "cm_cant": "Piezas por caja master", "cm_peso": "Peso caja master (kg)",
+    "cm_lr": "Largo caja master (cm)", "cm_an": "Ancho caja master (cm)", "cm_al": "Alto caja master (cm)",
+    "cm_m3": "Volumen caja master (m3)", "adicional": "Empaque adicional", "(alta)": "Alta del producto", "sat_codigo": "Código SAT", "sat_desc": "Descripción SAT",
+}
+
+
+def _exigir_edicion(user):
+    if user.get("rol") not in ("admin", "gerente"):
+        raise HTTPException(403, "Solo un gerente o administrador puede editar el catálogo.")
+
+
+def _iso(dt):
+    return (dt.isoformat() + "Z") if dt else None
+
+
+def _ser_item(i: CatalogoItem) -> dict:
+    return {
+        "sku": i.sku, "descripcion": i.descripcion or "",
+        "peso_unit": i.peso_unit or 0, "lr_unit": i.lr_unit or 0, "an_unit": i.an_unit or 0, "al_unit": i.al_unit or 0, "m3_unit": i.m3_unit or 0,
+        "cm_cant": i.cm_cant or 0, "cm_peso": i.cm_peso or 0, "cm_lr": i.cm_lr or 0, "cm_an": i.cm_an or 0, "cm_al": i.cm_al or 0, "cm_m3": i.cm_m3 or 0,
+        "sat_codigo": i.sat_codigo or "", "sat_desc": i.sat_desc or "",
+        "campos_manuales": sorted(_manuales(i)), "origen": i.origen or "hoja",
+        "editado_por": i.editado_por, "editado_en": _iso(i.editado_en),
+    }
+
+
+def _ser_adic(a: CatalogoAdicional) -> dict:
+    return {"id": a.id, "sku_base": a.sku_base, "tipo": a.tipo, "tipo_nombre": TIPOS_ADICIONAL.get(a.tipo, a.tipo), "nombre": a.nombre,
+            "corresponde_a": a.corresponde_a or "", "cantidad_por_equipo": a.cantidad_por_equipo or 1, "peso_kg": a.peso_kg or 0,
+            "lr": a.lr or 0, "an": a.an or 0, "al": a.al or 0, "activo": bool(a.activo), "creado_por": a.creado_por,
+            "creado_en": _iso(a.creado_en), "actualizado_en": _iso(a.actualizado_en)}
+
+
+def _ser_hist(h: CatalogoHistorial) -> dict:
+    return {"id": h.id, "sku": h.sku, "campo": h.campo, "campo_nombre": ETIQ_CAMPO.get(h.campo, h.campo),
+            "anterior": h.valor_anterior, "nuevo": h.valor_nuevo, "origen": h.origen, "motivo": h.motivo,
+            "usuario": h.usuario, "creado_en": _iso(h.creado_en)}
+
+
+def _avisos(d: dict) -> list:
+    """Observaciones de coherencia; no bloquean el guardado."""
+    av = []
+    if d["cm_cant"] > 0:
+        if not d["cm_peso"]:
+            av.append("La caja master no tiene peso capturado.")
+        elif d["peso_unit"] and not (0.5 <= d["cm_peso"] / (d["peso_unit"] * d["cm_cant"]) <= 2):
+            av.append("El peso de la caja master no cuadra con peso unitario x piezas por caja; revísalo.")
+        if not (d["cm_lr"] and d["cm_an"] and d["cm_al"]):
+            av.append("A la caja master le faltan medidas.")
+    if not d["peso_unit"]:
+        av.append("El producto no tiene peso unitario.")
+    return av
+
+
+def _numero(valor, campo):
+    if valor is None or valor == "":
+        return 0
+    try:
+        n = float(str(valor).replace(",", "."))
+    except ValueError:
+        raise HTTPException(400, f"{ETIQ_CAMPO.get(campo, campo)}: escribe un número.")
+    if n != n or n < 0 or n > 1_000_000:
+        raise HTTPException(400, f"{ETIQ_CAMPO.get(campo, campo)}: valor fuera de rango.")
+    return n
+
+
+@router.get("/gestion")
+async def gestion_listar(buscar: str = "", filtro: str = "todos", limite: int = 60, pagina: int = 0,
+                         db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    limite = max(1, min(limite, 200))
+    con_adic = select(CatalogoAdicional.sku_base).where(CatalogoAdicional.activo == True)  # noqa: E712
+    q = select(CatalogoItem)
+    if buscar.strip():
+        p = f"%{buscar.strip()}%"
+        q = q.where(CatalogoItem.sku.ilike(p) | CatalogoItem.descripcion.ilike(p))
+    if filtro == "sin_master":
+        q = q.where(or_(CatalogoItem.cm_cant == None, CatalogoItem.cm_cant <= 0))  # noqa: E711
+    elif filtro == "editados":
+        q = q.where(CatalogoItem.campos_manuales.is_not(None), CatalogoItem.campos_manuales != "[]")
+    elif filtro == "con_adicionales":
+        q = q.where(CatalogoItem.sku.in_(con_adic))
+    elif filtro == "sin_peso":
+        q = q.where(or_(CatalogoItem.peso_unit == None, CatalogoItem.peso_unit <= 0))  # noqa: E711
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
+    filas = list((await db.execute(q.order_by(CatalogoItem.sku).limit(limite).offset(max(0, pagina) * limite))).scalars())
+    skus = [f.sku for f in filas]
+    n_adic = {}
+    if skus:
+        r = await db.execute(select(CatalogoAdicional.sku_base, func.count()).where(CatalogoAdicional.sku_base.in_(skus), CatalogoAdicional.activo == True)  # noqa: E712
+                             .group_by(CatalogoAdicional.sku_base))
+        n_adic = {k: n for k, n in r.all()}
+    items = []
+    for f in filas:
+        d = _ser_item(f)
+        d["adicionales"] = n_adic.get(f.sku, 0)
+        items.append(d)
+    resumen = {
+        "total": (await db.execute(select(func.count(CatalogoItem.sku)))).scalar() or 0,
+        "sin_master": (await db.execute(select(func.count(CatalogoItem.sku)).where(or_(CatalogoItem.cm_cant == None, CatalogoItem.cm_cant <= 0)))).scalar() or 0,  # noqa: E711
+        "editados": (await db.execute(select(func.count(CatalogoItem.sku)).where(CatalogoItem.campos_manuales.is_not(None), CatalogoItem.campos_manuales != "[]"))).scalar() or 0,
+        "con_adicionales": len((await db.execute(select(CatalogoAdicional.sku_base).where(CatalogoAdicional.activo == True).distinct())).all()),  # noqa: E712
+    }
+    return {"total": total, "pagina": pagina, "limite": limite, "items": items, "resumen": resumen,
+            "puede_editar": user.get("rol") in ("admin", "gerente")}
+
+
+@router.get("/gestion/historial")
+async def gestion_historial_global(sku: str = "", usuario: str = "", limite: int = 100,
+                                   db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    q = select(CatalogoHistorial).order_by(CatalogoHistorial.creado_en.desc(), CatalogoHistorial.id.desc()).limit(max(1, min(limite, 500)))
+    if sku.strip():
+        q = q.where(CatalogoHistorial.sku.ilike(f"%{sku.strip()}%"))
+    if usuario.strip():
+        q = q.where(CatalogoHistorial.usuario == usuario.strip())
+    return [_ser_hist(h) for h in (await db.execute(q)).scalars()]
+
+
+async def _item_o_404(db, sku):
+    i = await db.get(CatalogoItem, (sku or "").strip().upper())
+    if not i:
+        raise HTTPException(404, "Ese producto no está en el catálogo.")
+    return i
+
+
+@router.get("/gestion/{sku}")
+async def gestion_detalle(sku: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    i = await _item_o_404(db, sku)
+    ad = (await db.execute(select(CatalogoAdicional).where(CatalogoAdicional.sku_base == i.sku).order_by(CatalogoAdicional.creado_en))).scalars()
+    hi = (await db.execute(select(CatalogoHistorial).where(CatalogoHistorial.sku == i.sku)
+                           .order_by(CatalogoHistorial.creado_en.desc(), CatalogoHistorial.id.desc()).limit(200))).scalars()
+    d = _ser_item(i)
+    return {"item": d, "avisos": _avisos(d), "adicionales": [_ser_adic(a) for a in ad], "historial": [_ser_hist(h) for h in hi],
+            "puede_editar": user.get("rol") in ("admin", "gerente"), "etiquetas": ETIQ_CAMPO}
+
+
+class CatalogoEditarIn(BaseModel):
+    campos: dict
+    motivo: str = ""
+
+
+class CatalogoNuevoIn(BaseModel):
+    sku: str
+    descripcion: str = ""
+    campos: dict = {}
+    motivo: str = ""
+
+
+def _aplicar_edicion(db, item: CatalogoItem, campos: dict, motivo: str, usuario: str, origen="manual") -> list:
+    cambiados = []
+    manual = _manuales(item)
+    for campo, valor in campos.items():
+        if campo not in CAMPOS_EDITABLES:
+            raise HTTPException(400, f"Campo no editable: {campo}")
+        if campo in CAMPOS_TXT:
+            nuevo = (str(valor).strip() if valor is not None else "") or None
+            if campo == "descripcion":
+                nuevo = nuevo or ""
+        elif campo in CAMPOS_INT:
+            nuevo = int(round(_numero(valor, campo)))
+        else:
+            nuevo = _numero(valor, campo)
+        ant = getattr(item, campo)
+        if _igual(ant, nuevo):
+            continue
+        db.add(CatalogoHistorial(sku=item.sku, campo=campo, valor_anterior=_txt(ant), valor_nuevo=_txt(nuevo),
+                                 origen=origen, motivo=motivo or None, usuario=usuario))
+        setattr(item, campo, nuevo)
+        manual.add(campo)
+        cambiados.append(campo)
+    # volumen calculado a partir de las medidas (cm -> m3) cuando cambian y no se capturo a mano
+    for pref, m3c in (("", "m3_unit"), ("cm_", "cm_m3")):
+        dims = [pref + "lr" if pref else "lr_unit", pref + "an" if pref else "an_unit", pref + "al" if pref else "al_unit"]
+        if any(d in cambiados for d in dims) and m3c not in cambiados:
+            lr, an, al = (getattr(item, d) or 0 for d in dims)
+            if lr and an and al:
+                v = round(lr * an * al / 1_000_000, 6)
+                ant = getattr(item, m3c)
+                if not _igual(ant, v):
+                    db.add(CatalogoHistorial(sku=item.sku, campo=m3c, valor_anterior=_txt(ant), valor_nuevo=_txt(v), origen=origen,
+                                             motivo="Calculado de las medidas", usuario=usuario))
+                    setattr(item, m3c, v)
+                    manual.add(m3c)
+                    cambiados.append(m3c)
+    if cambiados:
+        item.campos_manuales = json.dumps(sorted(manual))
+        item.origen = "manual" if item.origen == "manual" else (item.origen or "hoja")
+        item.editado_por = usuario
+        item.editado_en = func.now()
+        item.actualizado_en = func.now()
+    return cambiados
+
+
+@router.put("/gestion/{sku}")
+async def gestion_editar(sku: str, body: CatalogoEditarIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir_edicion(user)
+    if len(body.motivo.strip()) < 3:
+        raise HTTPException(400, "Escribe el motivo del cambio (para el historial).")
+    i = await _item_o_404(db, sku)
+    cambiados = _aplicar_edicion(db, i, body.campos, body.motivo.strip(), user["sub"])
+    await db.commit()
+    await db.refresh(i)
+    d = _ser_item(i)
+    return {"ok": True, "cambiados": cambiados, "item": d, "avisos": _avisos(d)}
+
+
+@router.post("/gestion")
+async def gestion_alta(body: CatalogoNuevoIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir_edicion(user)
+    sku = body.sku.strip().upper()
+    if not re.match(r"^[A-Z0-9][A-Z0-9._\-]{0,38}$", sku):
+        raise HTTPException(400, "Clave inválida: usa letras, números y . _ -")
+    if await db.get(CatalogoItem, sku):
+        raise HTTPException(409, "Esa clave ya existe en el catálogo.")
+    i = CatalogoItem(sku=sku, descripcion=body.descripcion.strip(), origen="manual", peso_unit=0, cm_cant=0)
+    db.add(i)
+    db.add(CatalogoHistorial(sku=sku, campo="(alta)", valor_nuevo=body.descripcion.strip(), origen="alta",
+                             motivo=body.motivo.strip() or "Alta manual", usuario=user["sub"]))
+    _aplicar_edicion(db, i, body.campos, body.motivo.strip() or "Alta manual", user["sub"])
+    i.campos_manuales = i.campos_manuales or "[]"
+    await db.commit()
+    await db.refresh(i)
+    d = _ser_item(i)
+    return {"ok": True, "item": d, "avisos": _avisos(d)}
+
+
+class LiberarIn(BaseModel):
+    campos: list
+
+
+@router.post("/gestion/{sku}/liberar")
+async def gestion_liberar(sku: str, body: LiberarIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Quita la protección a los campos para que la hoja vuelva a actualizarlos en la siguiente sincronización."""
+    _exigir_edicion(user)
+    i = await _item_o_404(db, sku)
+    manual = _manuales(i)
+    quitar = [c for c in body.campos if c in manual]
+    for c in quitar:
+        manual.discard(c)
+        db.add(CatalogoHistorial(sku=i.sku, campo=c, valor_anterior=None, valor_nuevo=None, origen="manual",
+                                 motivo="Se devolvió el campo a la sincronización de la hoja", usuario=user["sub"]))
+    i.campos_manuales = json.dumps(sorted(manual))
+    await db.commit()
+    return {"ok": True, "liberados": quitar}
+
+
+# ── empaques adicionales (extensiones / adicionales / accesorios) ──
+class AdicionalIn(BaseModel):
+    tipo: str = "extension"
+    nombre: str
+    corresponde_a: str = ""
+    cantidad_por_equipo: int = 1
+    peso_kg: float = 0
+    lr: float = 0
+    an: float = 0
+    al: float = 0
+    activo: bool = True
+    motivo: str = ""
+
+
+def _validar_adicional(b: AdicionalIn):
+    if b.tipo not in TIPOS_ADICIONAL:
+        raise HTTPException(400, "Tipo inválido.")
+    if not b.nombre.strip():
+        raise HTTPException(400, "Escribe el nombre del empaque adicional.")
+    if not b.corresponde_a.strip():
+        raise HTTPException(400, "Indica a qué corresponde (qué parte, función o pedido es).")
+    if not (1 <= b.cantidad_por_equipo <= 50):
+        raise HTTPException(400, "La cantidad por equipo debe estar entre 1 y 50.")
+    if min(b.peso_kg, b.lr, b.an, b.al) < 0:
+        raise HTTPException(400, "Peso y medidas no pueden ser negativos.")
+
+
+@router.post("/gestion/{sku}/adicionales")
+async def adicional_crear(sku: str, body: AdicionalIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir_edicion(user)
+    i = await _item_o_404(db, sku)
+    _validar_adicional(body)
+    a = CatalogoAdicional(sku_base=i.sku, tipo=body.tipo, nombre=body.nombre.strip(), corresponde_a=body.corresponde_a.strip(),
+                          cantidad_por_equipo=body.cantidad_por_equipo, peso_kg=body.peso_kg, lr=body.lr, an=body.an, al=body.al,
+                          activo=True, creado_por=user["sub"])
+    db.add(a)
+    db.add(CatalogoHistorial(sku=i.sku, campo="adicional", valor_nuevo=f"{TIPOS_ADICIONAL[body.tipo]}: {body.nombre.strip()} (x{body.cantidad_por_equipo}) - {body.corresponde_a.strip()}",
+                             origen="adicional", motivo=body.motivo.strip() or "Empaque adicional declarado", usuario=user["sub"]))
+    await db.commit()
+    await db.refresh(a)
+    return {"ok": True, "adicional": _ser_adic(a)}
+
+
+@router.put("/gestion/adicionales/{adic_id}")
+async def adicional_editar(adic_id: str, body: AdicionalIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir_edicion(user)
+    a = await db.get(CatalogoAdicional, adic_id)
+    if not a:
+        raise HTTPException(404, "No existe ese empaque adicional.")
+    _validar_adicional(body)
+    antes = f"{TIPOS_ADICIONAL.get(a.tipo, a.tipo)}: {a.nombre} (x{a.cantidad_por_equipo}) - {a.corresponde_a or ''}" + ("" if a.activo else " [inactivo]")
+    a.tipo, a.nombre, a.corresponde_a = body.tipo, body.nombre.strip(), body.corresponde_a.strip()
+    a.cantidad_por_equipo, a.peso_kg, a.lr, a.an, a.al, a.activo = body.cantidad_por_equipo, body.peso_kg, body.lr, body.an, body.al, body.activo
+    a.actualizado_en = func.now()
+    despues = f"{TIPOS_ADICIONAL[a.tipo]}: {a.nombre} (x{a.cantidad_por_equipo}) - {a.corresponde_a}" + ("" if a.activo else " [inactivo]")
+    if antes != despues:
+        db.add(CatalogoHistorial(sku=a.sku_base, campo="adicional", valor_anterior=antes, valor_nuevo=despues, origen="adicional",
+                                 motivo=body.motivo.strip() or "Cambio en empaque adicional", usuario=user["sub"]))
+    await db.commit()
+    await db.refresh(a)
+    return {"ok": True, "adicional": _ser_adic(a)}
+
+
+@router.get("/gestion/resumen/avisos")
+async def gestion_avisos(db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Productos con caja master incompleta o sin peso, para que el gerente los complete."""
+    res = await db.execute(select(CatalogoItem).where(CatalogoItem.cm_cant > 0).order_by(CatalogoItem.sku))
+    out = []
+    for i in res.scalars():
+        a = _avisos(_ser_item(i))
+        if a:
+            out.append({"sku": i.sku, "descripcion": i.descripcion, "avisos": a})
+    return {"total": len(out), "items": out[:300]}

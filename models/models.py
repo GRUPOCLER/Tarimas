@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean, Text, ForeignKey, Enum, text
+from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean, Text, ForeignKey, Enum, text, LargeBinary
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum, uuid
@@ -136,6 +136,46 @@ class CatalogoItem(Base):
     sat_codigo     = Column(String(20))
     sat_desc       = Column(Text)
     actualizado_en = Column(DateTime, server_default=func.now())
+    # Gestion local: campos editados en la plataforma (JSON ["peso_unit", ...]); la hoja ya no los pisa
+    campos_manuales = Column(Text)
+    origen          = Column(String(12), default="hoja")      # hoja | manual
+    editado_por     = Column(String(50))
+    editado_en      = Column(DateTime)
+
+
+class CatalogoHistorial(Base):
+    """Bitacora de cambios del catalogo (ediciones, altas, sincronizaciones, empaques adicionales)."""
+    __tablename__ = "catalogo_historial"
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    sku            = Column(String(40), index=True, nullable=False)
+    campo          = Column(String(40))
+    valor_anterior = Column(Text)
+    valor_nuevo    = Column(Text)
+    origen         = Column(String(12))     # manual | hoja | alta | adicional
+    motivo         = Column(Text)
+    usuario        = Column(String(50))
+    creado_en      = Column(DateTime, server_default=func.now(), index=True)
+
+
+class CatalogoAdicional(Base):
+    """Empaque extra declarado para un SKU (extension, adicional o accesorio). Al cargar una entrega con ese SKU
+    se crea solo, sin que el operador tenga que inventarlo."""
+    __tablename__ = "catalogo_adicionales"
+    id                  = Column(String(12), primary_key=True, default=gen_id)
+    sku_base            = Column(String(40), index=True, nullable=False)
+    tipo                = Column(String(20), default="extension")     # extension | adicional | accesorio
+    nombre              = Column(String(120), nullable=False)
+    corresponde_a       = Column(Text)                                 # a que corresponde (parte, funcion, proveedor...)
+    cantidad_por_equipo = Column(Integer, default=1)
+    peso_kg             = Column(Float, default=0)
+    lr                  = Column(Float, default=0)
+    an                  = Column(Float, default=0)
+    al                  = Column(Float, default=0)
+    activo              = Column(Boolean, default=True)
+    creado_por          = Column(String(50))
+    creado_en           = Column(DateTime, server_default=func.now())
+    actualizado_en      = Column(DateTime, server_default=func.now())
+
 
 # ── LOG DE ACCESOS ────────────────────────────────────────────
 class LogAcceso(Base):
@@ -246,6 +286,13 @@ class OrdenVenta(Base):
     factura_fecha    = Column(String(12))
     factura_en       = Column(DateTime)
     factura_por      = Column(String(50))
+    # responsables (usuario asignado por etapa)
+    asig_surtido     = Column(String(50), index=True)
+    asig_surtido_en  = Column(DateTime)
+    asig_surtido_por = Column(String(50))
+    asig_prep        = Column(String(50), index=True)
+    asig_prep_en     = Column(DateTime)
+    asig_prep_por    = Column(String(50))
 
 
 class OVLinea(Base):
@@ -334,6 +381,26 @@ class CatalogoRefacciones(Base):
 
 
 # ── ACCESO POR MODULO ────────────────────────────────────────
+class OVAdjunto(Base):
+    """PDF / XML de una OV (OV, entrega, factura). Se guardan en la base para no depender de disco."""
+    __tablename__ = "ov_adjuntos"
+    id         = Column(String(12), primary_key=True, default=gen_id)
+    ov_id      = Column(String(30), ForeignKey("ordenes_venta.id"), index=True, nullable=False)
+    tipo       = Column(String(20), nullable=False)
+    nombre     = Column(String(150))
+    mime       = Column(String(60))
+    tam        = Column(Integer, default=0)
+    subido_en  = Column(DateTime, server_default=func.now())
+    subido_por = Column(String(50))
+    contenido  = Column(LargeBinary)
+
+
+class OVConfig(Base):
+    __tablename__ = "ov_config"
+    clave = Column(String(40), primary_key=True)
+    valor = Column(String(200))
+
+
 class UsuarioModulo(Base):
     """Un usuario tiene acceso a un modulo con un rol propio en ese modulo.
     Los admin entran a todo y no necesitan filas aqui."""
