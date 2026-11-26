@@ -15,6 +15,7 @@ from services.auth import verificar_token
 
 ROLES_INFO = {
     "operador":    "Opera el modulo; sin reimpresion, reapertura ni cancelacion",
+    "auditor":     "Inventario: cuenta las ubicaciones que se le asignan y reporta incidencias",
     "gerente":     "Jefatura del modulo: autoriza, reabre, reimprime y registra operadores",
     "sap":         "Encargado SAP: carga OV y registra la entrega en SAP",
     "facturacion": "Facturacion: registra la factura",
@@ -27,9 +28,9 @@ MODULOS = {
         "roles": ["operador", "gerente"],
     },
     "inventario": {
-        "nombre": "Inventario y Operaciones", "ruta": "/inventario", "disponible": False,
-        "desc": "Layout de ubicaciones y conteos de inventario",
-        "roles": ["operador", "gerente"],
+        "nombre": "Inventario y Operaciones", "ruta": "/inventario", "disponible": True,
+        "desc": "Mapa del almacen, existencias de Odoo y conteos de inventario",
+        "roles": ["operador", "auditor", "gerente"],
     },
     "refacciones": {
         "nombre": "Refacciones", "ruta": "/ov", "disponible": True,

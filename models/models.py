@@ -423,3 +423,196 @@ class UsuarioModulo(Base):
     usuario = Column(String(50), nullable=False, index=True)
     modulo  = Column(String(20), nullable=False)
     rol     = Column(String(20), nullable=False, default="operador")
+
+
+# ───────────────────────── INVENTARIO Y OPERACIONES ─────────────────────────
+# Ubicaciones (plano), existencias leidas de Odoo (solo lectura) y conteos de auditoria.
+# Odoo nunca se modifica: todo lo que se captura vive en estas tablas.
+
+class InvUbicacion(Base):
+    __tablename__ = "inv_ubicaciones"
+    codigo    = Column(String(40), primary_key=True)
+    bodega    = Column(String(40))
+    rack      = Column(String(20))
+    lado      = Column(String(10))
+    tramo     = Column(String(10))
+    nivel     = Column(String(10))
+    zona      = Column(String(20))
+    capacidad = Column(Float)
+    x         = Column(Float, default=0)
+    y         = Column(Float, default=0)
+    ancho     = Column(Float, default=0)
+    alto      = Column(Float, default=0)
+    tipo      = Column(String(20))
+
+
+class InvExistencia(Base):
+    __tablename__ = "inv_existencias"
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    codigo        = Column(String(40), index=True, nullable=False)   # ubicacion (codigo de barras en Odoo)
+    producto      = Column(String(60), index=True, nullable=False)   # clave / default_code
+    producto_desc = Column(String(250))
+    cantidad      = Column(Float, default=0)
+    reservado     = Column(Float, default=0)
+
+
+class InvSync(Base):
+    __tablename__ = "inv_sync"
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    fecha       = Column(DateTime, nullable=False)
+    usuario     = Column(String(80))
+    quants      = Column(Integer, default=0)
+    ubicaciones = Column(Integer, default=0)
+    sin_mapa    = Column(Integer, default=0)
+    detalle     = Column(Text)
+
+
+class InvConteo(Base):
+    __tablename__ = "inv_conteos"
+    id           = Column(String(20), primary_key=True)
+    nombre       = Column(String(120))
+    alcance      = Column(String(250))
+    ciego        = Column(Boolean, default=True)
+    estatus      = Column(String(12), default="abierto")   # abierto | pausado | cerrado
+    creado_por   = Column(String(50))
+    fecha        = Column(DateTime)
+    cerrado_por  = Column(String(50))
+    fecha_cierre = Column(DateTime)
+    tipo         = Column(String(12), default="ubicacion")  # ubicacion | producto
+    productos    = Column(Text)
+    resumen      = Column(Text)    # foto de cifras al cierre (JSON)
+    firmas       = Column(Text)    # JSON [{nombre, cargo}]
+
+
+class InvConteoUbic(Base):
+    __tablename__ = "inv_conteo_ubic"
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    id_conteo   = Column(String(20), index=True, nullable=False)
+    codigo      = Column(String(40), index=True, nullable=False)
+    bodega      = Column(String(40))
+    zona        = Column(String(20))
+    estado      = Column(String(12), default="pendiente")   # pendiente | contada | reconteo
+    contada_por = Column(String(50))
+    fecha_conteo = Column(DateTime)
+    nota        = Column(Text)
+    grupo       = Column(String(80))
+    asignado_a  = Column(String(50))
+    ronda       = Column(Integer, default=1)
+    modo_reco   = Column(String(10))
+
+
+class InvConteoLinea(Base):
+    __tablename__ = "inv_conteo_lineas"
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    id_conteo     = Column(String(20), index=True, nullable=False)
+    codigo        = Column(String(40), index=True, nullable=False)
+    producto      = Column(String(60), nullable=False)
+    producto_desc = Column(String(250))
+    esperado      = Column(Float, default=0)
+    contado       = Column(Float)           # NULL = aun sin contar
+    inesperado    = Column(Boolean, default=False)
+    veces         = Column(Integer, default=0)
+    contado_por   = Column(String(50))
+    fecha_conteo  = Column(DateTime)
+    origen        = Column(String(80))
+
+
+class InvConteoRonda(Base):
+    __tablename__ = "inv_conteo_rondas"
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    id_conteo       = Column(String(20), index=True, nullable=False)
+    ronda           = Column(String(10))    # "1", "2", ... | "final" | "anulado"
+    codigo          = Column(String(40))
+    producto        = Column(String(60))
+    contado         = Column(Float)
+    contado_por     = Column(String(50))
+    fecha_conteo    = Column(DateTime)
+    nota            = Column(Text)
+    anulada         = Column(Boolean, default=False)
+    anulada_por     = Column(String(50))
+    fecha_anulacion = Column(DateTime)
+    motivo_anulacion = Column(Text)
+
+
+class InvConteoPausa(Base):
+    __tablename__ = "inv_conteo_pausas"
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    id_conteo     = Column(String(20), index=True, nullable=False)
+    inicio        = Column(DateTime)
+    pausado_por   = Column(String(50))
+    motivo        = Column(Text)
+    fin           = Column(DateTime)
+    reanudado_por = Column(String(50))
+
+
+class InvIncidencia(Base):
+    __tablename__ = "inv_incidencias"
+    id               = Column(String(20), primary_key=True)
+    id_conteo        = Column(String(20), index=True)   # vacio = de toda la auditoria (historicas)
+    fecha            = Column(DateTime)
+    reportado_por    = Column(String(50))
+    codigo           = Column(String(40))
+    producto         = Column(String(120))
+    producto_desc    = Column(String(250))
+    tipo             = Column(String(30))
+    cantidad         = Column(Float)
+    detalle          = Column(Text)
+    evidencia        = Column(Text)
+    estado           = Column(String(12), default="abierta")
+    resuelta_por     = Column(String(50))
+    fecha_resolucion = Column(DateTime)
+    nota_resolucion  = Column(Text)
+    auditor          = Column(String(80))
+    impacto          = Column(String(40))
+    accion           = Column(String(60))
+
+
+class InvCosto(Base):
+    __tablename__ = "inv_costos"
+    producto = Column(String(60), primary_key=True)
+    costo    = Column(Float, default=0)
+    fecha    = Column(DateTime)
+
+
+class InvOtraUN(Base):
+    """Productos que se marcan como mercancia de OTRA unidad de negocio (no cuentan como sobrante)."""
+    __tablename__ = "inv_otras_un"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    producto   = Column(String(60), index=True)
+    unidad     = Column(String(60))
+    nota       = Column(Text)
+    creado_por = Column(String(50))
+    fecha      = Column(DateTime)
+
+
+class InvRecontoSKU(Base):
+    __tablename__ = "inv_reconteo_sku"
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    id_conteo   = Column(String(20), index=True)
+    producto    = Column(String(60))
+    recontado   = Column(Float)
+    observacion = Column(Text)
+    personas    = Column(Text)
+    cargado_por = Column(String(50))
+    fecha       = Column(DateTime)
+
+
+class InvComprometido(Base):
+    __tablename__ = "inv_comprometido"
+    id        = Column(Integer, primary_key=True, autoincrement=True)
+    id_conteo = Column(String(20), index=True)
+    producto  = Column(String(60))
+    fuente    = Column(String(30))
+    cantidad  = Column(Float)
+    motivo    = Column(Text)
+    usuario   = Column(String(50))
+    fecha     = Column(DateTime)
+
+
+class InvLog(Base):
+    __tablename__ = "inv_log"
+    id      = Column(Integer, primary_key=True, autoincrement=True)
+    fecha   = Column(DateTime)
+    usuario = Column(String(80))
+    accion  = Column(String(40), index=True)
+    detalle = Column(Text)
