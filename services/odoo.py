@@ -36,14 +36,26 @@ def _partner_map():
 
 PARTNER_MAP = _partner_map()
 
-async def _rpc(model: str, method: str, args: list, kwargs: dict = None, _reintento: bool = True):
+CAMPOS_OMITIDOS = {}   # "modelo.campo" -> veces que Odoo lo rechazo (campo renombrado/eliminado entre versiones)
+_RE_CAMPO = re.compile(r"Invalid field '([^']+)' on '([^']+)'|Invalid field '([^']+)' in leaf|Unknown field '([^']+)'", re.I)
+
+
+def _campo_invalido(msg: str, model: str):
+    m = re.search(r"Invalid field '([^']+)' on '([^']+)'", msg or "")
+    if m and m.group(2) == model:
+        return m.group(1)
+    m = re.search(r"(?:Unknown|Invalid) field '([^']+)'", msg or "")
+    return m.group(1) if m else None
+
+
+async def _rpc(model: str, method: str, args: list, kwargs: dict = None, _reintento: bool = True, timeout: float = None):
     if not ODOO_URL:
         raise Exception(
             "ODOO_URL no esta configurada en las variables de Railway. "
             "Revisa el servicio cler-backend -> Variables."
         )
     try:
-        async with httpx.AsyncClient(timeout=ODOO_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=timeout or ODOO_TIMEOUT) as client:
             payload = {
                 "jsonrpc": "2.0", "method": "call",
                 "params": {
@@ -61,7 +73,15 @@ async def _rpc(model: str, method: str, args: list, kwargs: dict = None, _reinte
         # La sesion/uid guardado puede haber caducado (cambio de clave, reinicio de Odoo): se vuelve a autenticar una vez.
         if _reintento and ("access" in msg.lower() or "denied" in msg.lower() or "session" in msg.lower()):
             _uid_cache.clear()
-            return await _rpc(model, method, args, kwargs, _reintento=False)
+            return await _rpc(model, method, args, kwargs, _reintento=False, timeout=timeout)
+        # Red de seguridad entre versiones: si Odoo rechaza un campo pedido en 'fields', se omite y se reintenta.
+        kw = dict(kwargs or {})
+        malo = _campo_invalido(msg, model)
+        if malo and isinstance(kw.get("fields"), list) and malo in kw["fields"]:
+            kw["fields"] = [f for f in kw["fields"] if f != malo]
+            CAMPOS_OMITIDOS[model + "." + malo] = CAMPOS_OMITIDOS.get(model + "." + malo, 0) + 1
+            _fields_cache.pop(model, None)
+            return await _rpc(model, method, args, kw, _reintento=_reintento, timeout=timeout)
         raise Exception(msg)
     return data["result"]
 
@@ -134,10 +154,10 @@ def _clave_desc(nombre: str):
 async def _campos_move() -> list:
     """Campos de stock.move que existan en ESTA base (v16 usa quantity_done; v17+ usa quantity)."""
     mf = await _fields("stock.move")
-    base = ["product_id", "product_uom_qty", "state", "picking_id", "name"]
+    base = ["product_id", "product_uom_qty", "state", "picking_id"]
     if not mf:
         return base + ["quantity"]
-    return base + [c for c in ("quantity", "quantity_done", "product_qty") if c in mf]
+    return base + [c for c in ("name", "description_picking", "quantity", "quantity_done", "product_qty") if c in mf]
 
 
 def _cantidad_move(m: dict):
@@ -618,4 +638,4 @@ async def diagnostico_v19() -> dict:
             version = (v.json().get("result") or {}).get("server_version")
     except Exception:
         pass
-    return {"version_odoo": version, "faltantes": faltan, "ok": not faltan, "detalle": res}
+    return {"version_odoo": version, "faltantes": faltan, "ok": not faltan, "detalle": res, "campos_omitidos_en_runtime": dict(CAMPOS_OMITIDOS)}

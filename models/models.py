@@ -395,6 +395,19 @@ class CatalogoRefacciones(Base):
 
 
 # ── ACCESO POR MODULO ────────────────────────────────────────
+class OVEnlace(Base):
+    """Liga publica de seguimiento de una OV para el cliente (sin usuario). El token es secreto y se puede revocar."""
+    __tablename__ = "ov_enlaces"
+    token      = Column(String(60), primary_key=True)
+    ov_id      = Column(String(30), ForeignKey("ordenes_venta.id"), index=True, nullable=False)
+    activo     = Column(Boolean, default=True)
+    creado_en  = Column(DateTime, server_default=func.now())
+    creado_por = Column(String(50))
+    revocado_en = Column(DateTime)
+    vistas     = Column(Integer, default=0)
+    ultima_vista = Column(DateTime)
+
+
 class OVAdjunto(Base):
     """PDF / XML de una OV (OV, entrega, factura). Se guardan en la base para no depender de disco."""
     __tablename__ = "ov_adjuntos"

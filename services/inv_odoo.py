@@ -17,18 +17,8 @@ def etiqueta_filtro() -> str:
 
 
 async def rpc(model, method, args, kwargs=None):
-    if not _o.ODOO_URL:
-        raise Exception("ODOO_URL no esta configurada en las variables de Railway.")
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        payload = {"jsonrpc": "2.0", "method": "call", "params": {
-            "service": "object", "method": "execute_kw",
-            "args": [_o.ODOO_DB, await _o._uid(client), _o.ODOO_PASSWORD, model, method, args, kwargs or {}]}}
-        r = await client.post(_o.ODOO_URL + "/jsonrpc", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            raise Exception(data["error"].get("data", {}).get("message", "Error Odoo"))
-        return data["result"]
+    """Mismo canal que services.odoo._rpc (reautenticacion, omision de campos que la version no tiene)."""
+    return await _o._rpc(model, method, args, kwargs, timeout=TIMEOUT)
 
 
 def clave_nombre(display: str):

@@ -22,7 +22,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models.models import (OVAdjunto, OVConfig, Usuario, UsuarioModulo, OrdenVenta, OVLinea, OVEvento, OVEscaneo, OVCaja, OVCajaItem,
+from models.models import (OVEnlace, OVAdjunto, OVConfig, Usuario, UsuarioModulo, OrdenVenta, OVLinea, OVEvento, OVEscaneo, OVCaja, OVCajaItem,
                            CatalogoRefacciones, CatalogoItem)
 from parsers.sap_ov_refacciones import (parsear_ov, parsear_entrega, parsear_factura, norm_codigo)
 from services.permisos import acceso_modulo
@@ -1318,4 +1318,55 @@ async def adj_borrar(adj_id: str, db: AsyncSession = Depends(get_db), user: dict
         raise HTTPException(404, "No existe ese archivo.")
     await db.delete(a)
     await db.commit()
+    return {"ok": True}
+
+
+# ───────────────────────── liga de seguimiento para el cliente ─────────────────────────
+def _enlace_ser(e):
+    return {"token": e.token, "activo": bool(e.activo), "creado_en": _iso(e.creado_en), "creado_por": e.creado_por,
+            "vistas": e.vistas or 0, "ultima_vista": _iso(e.ultima_vista)} if e else None
+
+
+async def _enlace_activo(db, ov_id):
+    r = await db.execute(select(OVEnlace).where(OVEnlace.ov_id == ov_id, OVEnlace.activo == True).order_by(OVEnlace.creado_en.desc()))  # noqa: E712
+    return r.scalars().first()
+
+
+@router.get("/{ov_id}/enlace")
+async def enlace_ver(ov_id: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir(user, *ROLES_CARGA)
+    await _get_ov(db, ov_id)
+    return {"enlace": _enlace_ser(await _enlace_activo(db, ov_id))}
+
+
+@router.post("/{ov_id}/enlace")
+async def enlace_crear(ov_id: str, regenerar: bool = False, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Crea (o devuelve) la liga publica de seguimiento. Regenerar revoca la anterior."""
+    _exigir(user, *ROLES_CARGA)
+    ov = await _get_ov(db, ov_id)
+    if ov.estatus == "cancelada":
+        raise HTTPException(409, "La OV está cancelada.")
+    e = await _enlace_activo(db, ov_id)
+    if e and not regenerar:
+        return {"enlace": _enlace_ser(e)}
+    if e:
+        e.activo = False
+        e.revocado_en = datetime.utcnow()
+    import secrets
+    e = OVEnlace(token=secrets.token_urlsafe(24), ov_id=ov_id, activo=True, creado_por=user["sub"], vistas=0)
+    db.add(e)
+    await db.commit()
+    await db.refresh(e)
+    return {"enlace": _enlace_ser(e)}
+
+
+@router.delete("/{ov_id}/enlace")
+async def enlace_revocar(ov_id: str, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    _exigir(user, *ROLES_CARGA)
+    await _get_ov(db, ov_id)
+    e = await _enlace_activo(db, ov_id)
+    if e:
+        e.activo = False
+        e.revocado_en = datetime.utcnow()
+        await db.commit()
     return {"ok": True}
