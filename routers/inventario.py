@@ -161,7 +161,7 @@ async def _listar(db, bodega="", zona="", codigo="", producto="", estado="todas"
 async def api_listar(bodega: str = "", zona: str = "", codigo: str = "", producto: str = "", estado: str = "todas", pagina: int = 1, limite: int = 100,
                      db: AsyncSession = Depends(get_db), u: dict = Depends(inv_user)):
     rows = await _listar(db, bodega, zona, codigo, producto, estado)
-    pagina, lim = max(1, pagina), min(max(limite, 1), 500)
+    pagina, lim = max(1, pagina), min(max(limite, 1), 5000)
     return {"total": len(rows), "pagina": pagina, "limite": lim, "filas": rows[(pagina - 1) * lim: pagina * lim]}
 
 

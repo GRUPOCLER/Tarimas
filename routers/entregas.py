@@ -511,8 +511,12 @@ async def procesar_pdf(
     datos["fuente"]   = "pdf"
     datos["comercializador"] = datos.get("comercializador") or comercializador
     datos["forzar"]   = forzar
+    avisos = datos.pop("avisos", []) or []
     body = EntregaIn(**datos)
-    return await crear_entrega(body, db, user)
+    res = await crear_entrega(body, db, user)
+    res["avisos"] = avisos
+    res["total_piezas"] = sum(p.cantidad_total for p in body.productos)
+    return res
 
 def _extraer_texto_pdf(contenido: bytes) -> str:
     import pdfplumber, io

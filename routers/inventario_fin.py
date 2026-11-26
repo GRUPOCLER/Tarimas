@@ -147,6 +147,12 @@ async def calcular_final(db, c, actualizar=False, con_mov=False):
             await actualizar_costos(db, claves if actualizar else faltan); cm = await costos_mapa(db)
         except Exception as e:
             await db.rollback(); aviso.append(f"No se pudieron leer costos de Odoo ({str(e)[:120]}). Se usan los costos guardados.")
+            await db.refresh(c)
+            # el rollback expira los objetos ORM ya cargados: se recargan
+            ubs = await ubs_de(db, id_); contadas = {txt(x.codigo): x for x in ubs if x.estado == "contada"}
+            todas = [l for l in await lineas_de(db, id_) if txt(l.codigo) in contadas and l.contado is not None]
+            lineas = [l for l in todas if not es_otra_un(bool(l.inesperado), l.origen, l.producto, cat)]
+            incs = await incidencias_de(db, id_); cm = await costos_mapa(db)
     costo = lambda k: cm.get(k, 0)
     sin_costo = sorted({txt(l.producto) for l in lineas if not (cm.get(txt(l.producto), 0) > 0)})
     sku, dif, tot, gb = {}, [], {"sistema": 0.0, "contado": 0.0, "falt": 0.0, "sobr": 0.0, "us": 0.0, "uc": 0.0}, {"bodega": {}, "zona": {}}

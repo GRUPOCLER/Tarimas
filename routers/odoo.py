@@ -239,3 +239,15 @@ async def quitar_almacen_usuario(id_asignacion: int, db: AsyncSession = Depends(
     await db.delete(a)
     await db.commit()
     return {"ok": True}
+
+
+@router.get("/diagnostico-v19")
+async def diagnostico_v19(user: dict = Depends(get_current_user)):
+    """Solo lectura: confirma que los campos de Odoo que usa la plataforma existen en esta version (v19)."""
+    if user.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Solo admin.")
+    odoo_svc.reset_cache_campos()
+    try:
+        return await odoo_svc.diagnostico_v19()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))

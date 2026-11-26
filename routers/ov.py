@@ -35,8 +35,8 @@ ESTATUS = [
     {"id": "en_surtido",     "nombre": "En surtido",        "umbral_horas": 4},
     {"id": "surtida",        "nombre": "Surtida",           "umbral_horas": 8},
     {"id": "en_preparacion", "nombre": "En preparación",    "umbral_horas": 4},
-    {"id": "preparada",      "nombre": "Preparada",         "umbral_horas": 4},
-    {"id": "entregada_sap",  "nombre": "Entrega generada",  "umbral_horas": 24},
+    {"id": "preparada",      "nombre": "Entrega en sistema pendiente", "umbral_horas": 4},
+    {"id": "entregada_sap",  "nombre": "Entrega generada, en espera de facturación", "umbral_horas": 24},
     {"id": "facturada",      "nombre": "Facturada",         "umbral_horas": None},
     {"id": "cancelada",      "nombre": "Cancelada",         "umbral_horas": None},
 ]
@@ -605,6 +605,72 @@ async def caja_escanear(ov_id: str, cid: int, body: EscaneoIn, db: AsyncSession 
     return await _detalle(db, ov, user)
 
 
+class AsignarItemIn(BaseModel):
+    linea_id: int
+    cantidad: Optional[int] = None      # None = todo lo pendiente de esa partida
+
+
+class AsignarCajaIn(BaseModel):
+    items: list[AsignarItemIn] = []
+    todo: bool = False                  # True = todo lo surtido y no empacado de la OV
+
+
+@router.post("/{ov_id}/preparacion/cajas/{cid}/asignar")
+async def caja_asignar(ov_id: str, cid: int, body: AsignarCajaIn, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Asigna a la caja abierta varias partidas a la vez (total, parcial o mezcla). Es atomico: si una falla, no se mueve nada."""
+    ov = await _get_ov(db, ov_id)
+    await _exigir_operar(db, ov, "prep", user)
+    if ov.estatus != "en_preparacion":
+        raise HTTPException(409, "La OV no está en preparación.")
+    c = await _caja(db, ov_id, cid)
+    if c.estatus != "abierta":
+        raise HTTPException(409, "Esa caja ya está cerrada.")
+    ls = {l.id: l for l in await _lineas(db, ov_id)}
+    pedido = []
+    if body.todo:
+        pedido = [(l, (l.surtida or 0) - (l.empacada or 0)) for l in ls.values()]
+    else:
+        if not body.items:
+            raise HTTPException(400, "Elige al menos una partida.")
+        vistos = set()
+        for it in body.items:
+            l = ls.get(it.linea_id)
+            if not l:
+                raise HTTPException(404, "Una de las partidas no pertenece a esta OV.")
+            if it.linea_id in vistos:
+                raise HTTPException(400, f"La partida {l.codigo} viene repetida.")
+            vistos.add(it.linea_id)
+            libre = (l.surtida or 0) - (l.empacada or 0)
+            q = libre if it.cantidad is None else it.cantidad
+            if q < 1:
+                raise HTTPException(400, f"{l.codigo}: la cantidad debe ser al menos 1.")
+            pedido.append((l, q))
+    pedido = [(l, q) for l, q in pedido if q > 0]
+    if not pedido:
+        raise HTTPException(409, "No hay piezas por empacar.")
+    for l, q in pedido:                 # _meter valida contra lo pendiente; cualquier error aborta todo
+        await _meter(db, ov, c, l, q, user, "lote")
+    await db.commit()
+    return await _detalle(db, ov, user)
+
+
+@router.post("/{ov_id}/preparacion/cajas/{cid}/vaciar")
+async def caja_vaciar(ov_id: str, cid: int, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """Saca todo lo que tiene la caja abierta (regresa las piezas a 'por empacar')."""
+    ov = await _get_ov(db, ov_id)
+    await _exigir_operar(db, ov, "prep", user)
+    c = await _caja(db, ov_id, cid)
+    if c.estatus != "abierta":
+        raise HTTPException(409, "Esa caja ya está cerrada.")
+    for it in (await db.execute(select(OVCajaItem).where(OVCajaItem.caja_id == cid, OVCajaItem.cantidad > 0))).scalars():
+        l = await db.get(OVLinea, it.linea_id)
+        l.empacada = max(0, (l.empacada or 0) - it.cantidad)
+        db.add(OVEscaneo(ov_id=ov_id, linea_id=it.linea_id, caja_id=cid, etapa="preparacion", cantidad=-it.cantidad, codigo=l.codigo, metodo="manual", usuario=user["sub"]))
+        it.cantidad = 0
+    await db.commit()
+    return await _detalle(db, ov, user)
+
+
 @router.post("/{ov_id}/preparacion/cajas/{cid}/quitar")
 async def caja_quitar(ov_id: str, cid: int, linea_id: int, cantidad: int = 1, db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
     ov = await _get_ov(db, ov_id)
@@ -805,22 +871,35 @@ async def entrega_validar(ov_id: str, archivo: UploadFile = File(...), db: Async
     dup = (await db.execute(select(OrdenVenta.num_ov).where(OrdenVenta.entrega_folio == en["folio"], OrdenVenta.id != ov_id))).scalars().first()
     if dup:
         out["avisos"].append(f"El folio {en['folio']} ya está registrado en la OV {dup}.")
+    out["cliente_coincide"] = not (ov.cliente and en["cliente"] and norm_codigo(ov.cliente) != norm_codigo(en["cliente"]))
+    out["folio_duplicado"] = bool(dup)
+    out["corresponde"] = bool(out["conciliacion"]["limpia"] and out["cliente_coincide"] and not dup)
+    out["puede_autorizar"] = user.get("rol") in ROLES_JEFE
     return out
 
 
 @router.post("/{ov_id}/entrega")
-async def entrega_registrar(ov_id: str, folio: str = Form(""), confirmar_diferencias: bool = Form(False),
+async def entrega_registrar(ov_id: str, folio: str = Form(""), confirmar_diferencias: bool = Form(False), motivo: str = Form(""),
                             archivo: Optional[UploadFile] = File(None),
                             db: AsyncSession = Depends(get_db), user: dict = Depends(get_current_user)):
+    """La entrega solo se da por generada con el PDF de SAP, y solo si corresponde a lo preparado (mismas partidas y cantidades,
+    mismo cliente, folio no usado). Una diferencia o un registro sin PDF solo los autoriza un gerente/admin, con motivo."""
     _exigir(user, *ROLES_CARGA)
     ov = await _get_ov(db, ov_id)
     if ov.estatus != "preparada":
         raise HTTPException(409, "La entrega se registra cuando la OV está preparada.")
+    es_jefe = user.get("rol") in ROLES_JEFE
+    motivo = (motivo or "").strip()
     ls = await _lineas(db, ov_id)
-    en = None
+    en, datos = None, None
     if archivo is not None and archivo.filename:
+        datos = await archivo.read()
+        if not datos.lstrip()[:5].startswith(b"%PDF"):
+            raise HTTPException(400, "El archivo no es un PDF.")
+        if len(datos) > MAX_ADJUNTO:
+            raise HTTPException(413, "El archivo pesa más de 9 MB.")
         try:
-            en = parsear_entrega(await archivo.read())
+            en = parsear_entrega(datos)
         except Exception as e:
             raise HTTPException(400, f"No se pudo leer el PDF de la entrega: {e}")
         if not en["folio"]:
@@ -829,15 +908,29 @@ async def entrega_registrar(ov_id: str, folio: str = Form(""), confirmar_diferen
             raise HTTPException(400, f"El folio escrito ({folio.strip()}) no coincide con el del PDF ({en['folio']}).")
         folio = en["folio"]
     folio = folio.strip()
-    if not folio:
-        raise HTTPException(400, "Escribe el folio de la entrega o adjunta el PDF.")
+    if not en:
+        if not (es_jefe and len(motivo) >= 5):
+            raise HTTPException(409, "Falta el PDF de la entrega generada en SAP. Sin él no se puede cerrar la entrega ni pasar a facturación. "
+                                     "Solo un gerente puede registrarla sin PDF, con motivo.")
+        if not folio:
+            raise HTTPException(400, "Escribe el folio de la entrega.")
     dup = (await db.execute(select(OrdenVenta.num_ov).where(OrdenVenta.entrega_folio == folio, OrdenVenta.id != ov_id))).scalars().first()
     if dup:
         raise HTTPException(409, f"El folio {folio} ya está registrado en la OV {dup}.")
+    nota = f"Entrega SAP {folio}"
     if en:
         con = _conciliar(ls, en)
-        if not con["limpia"] and not confirmar_diferencias:
-            raise HTTPException(409, "La entrega no coincide con lo preparado. Revisa las diferencias y confirma si es correcto.")
+        problemas = []
+        if not con["limpia"]:
+            problemas.append("las partidas o cantidades no coinciden con lo preparado")
+        if ov.cliente and en["cliente"] and norm_codigo(ov.cliente) != norm_codigo(en["cliente"]):
+            problemas.append(f"el cliente de la entrega ({en['cliente']}) no es el de la OV ({ov.cliente})")
+        if problemas:
+            if not es_jefe:
+                raise HTTPException(409, "La entrega no coincide con la OV: " + "; ".join(problemas) + ". Solo un gerente puede autorizarla; avísale para que la valide.")
+            if not (confirmar_diferencias and len(motivo) >= 5):
+                raise HTTPException(409, "La entrega no coincide con la OV: " + "; ".join(problemas) + ". Para autorizarla confirma y escribe el motivo.")
+            nota += f" (autorizada con diferencias por {user['sub']}: {motivo[:150]})"
         por = {}
         for p in en["partidas"]:
             a = por.setdefault(p["codigo_norm"], {"cantidad": 0, "lotes": []})
@@ -848,10 +941,16 @@ async def entrega_registrar(ov_id: str, folio: str = Form(""), confirmar_diferen
             l.entrega_cantidad = a["cantidad"] if a else 0
             l.entrega_lotes = json.dumps(a["lotes"]) if a else None
         ov.entrega_fecha = en["fecha"]
+        # El PDF validado queda guardado junto con la OV en la misma operacion (no depende de otra llamada).
+        await db.execute(delete(OVAdjunto).where(OVAdjunto.ov_id == ov_id, OVAdjunto.tipo == "entrega_pdf"))
+        nombre = re.sub(r'[\\/:*?"<>|]+', "_", archivo.filename or "entrega.pdf")[:120]
+        db.add(OVAdjunto(ov_id=ov_id, tipo="entrega_pdf", nombre=nombre, mime="application/pdf", tam=len(datos), subido_por=user["sub"], contenido=datos))
+    else:
+        nota += f" (SIN PDF, autorizada por {user['sub']}: {motivo[:150]})"
     ov.entrega_folio = folio
     ov.entrega_en = datetime.utcnow()
     ov.entrega_por = user["sub"]
-    await _cambiar(db, ov, "entregada_sap", user, f"Entrega SAP {folio}")
+    await _cambiar(db, ov, "entregada_sap", user, nota)
     await db.commit()
     return {"ok": True, "ov": _ov_ser(ov, ls)}
 
@@ -866,6 +965,10 @@ async def factura_registrar(ov_id: str, folio: str = Form(""), confirmar: bool =
     ov = await _get_ov(db, ov_id)
     if ov.estatus != "entregada_sap":
         raise HTTPException(409, "La factura se registra cuando la entrega de SAP ya está capturada.")
+    tiene_pdf = (await db.execute(select(func.count()).select_from(OVAdjunto).where(OVAdjunto.ov_id == ov_id, OVAdjunto.tipo == "entrega_pdf"))).scalar()
+    excepcion = (await db.execute(select(func.count()).select_from(OVEvento).where(OVEvento.ov_id == ov_id, OVEvento.nota.like("%(SIN PDF%")))).scalar()
+    if not tiene_pdf and not excepcion:
+        raise HTTPException(409, "Falta el PDF de la entrega generada en SAP. Pídele al encargado de SAP que lo adjunte en Archivos.")
     uuid_, fecha = None, None
     cf = None
     if xml is not None and xml.filename:
@@ -1161,6 +1264,20 @@ async def adj_subir(ov_id: str, tipo: str = Form(...), archivo: UploadFile = Fil
     if tipo.startswith("factura") and ov.estatus not in ("entregada_sap", "facturada"):
         raise HTTPException(409, "La factura se adjunta cuando la entrega de SAP ya está capturada.")
     datos = await archivo.read()
+    if tipo == "entrega_pdf":
+        # El PDF de la entrega se valida y se guarda al registrar la entrega. Aqui solo se completa una OV ya entregada
+        # (por ejemplo una registrada antes de este control) y debe ser la MISMA entrega.
+        if ov.estatus not in ("entregada_sap", "facturada"):
+            raise HTTPException(409, "El PDF de la entrega se adjunta desde el panel Entrega en SAP, donde se valida contra lo preparado.")
+        ya = (await db.execute(select(func.count()).select_from(OVAdjunto).where(OVAdjunto.ov_id == ov_id, OVAdjunto.tipo == "entrega_pdf"))).scalar()
+        if ya and user.get("rol") not in ROLES_JEFE:
+            raise HTTPException(403, "Solo un gerente puede reemplazar el PDF de una entrega ya registrada.")
+        try:
+            en_ = parsear_entrega(datos)
+        except Exception as e:
+            raise HTTPException(400, f"No se pudo leer el PDF de la entrega: {e}")
+        if en_["folio"] != (ov.entrega_folio or ""):
+            raise HTTPException(409, f"El PDF es de la entrega {en_['folio'] or '(sin folio)'} y la registrada en esta OV es {ov.entrega_folio}.")
     if not datos:
         raise HTTPException(400, "El archivo está vacío.")
     if len(datos) > MAX_ADJUNTO:

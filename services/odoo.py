@@ -6,6 +6,7 @@ ODOO_URL      = os.getenv("ODOO_URL", "")
 ODOO_DB       = os.getenv("ODOO_DB", "")
 ODOO_LOGIN    = os.getenv("ODOO_LOGIN", "")
 ODOO_PASSWORD = os.getenv("ODOO_API_KEY", "")
+ODOO_TIMEOUT  = float(os.getenv("ODOO_TIMEOUT", "60"))
 
 # Ubicaciones destino de traspasos internos que interesan al almacen —
 # via variables de entorno para poder ajustarlas sin tocar codigo.
@@ -35,26 +36,34 @@ def _partner_map():
 
 PARTNER_MAP = _partner_map()
 
-async def _rpc(model: str, method: str, args: list, kwargs: dict = None):
+async def _rpc(model: str, method: str, args: list, kwargs: dict = None, _reintento: bool = True):
     if not ODOO_URL:
         raise Exception(
             "ODOO_URL no esta configurada en las variables de Railway. "
             "Revisa el servicio cler-backend -> Variables."
         )
-    async with httpx.AsyncClient(timeout=15) as client:
-        payload = {
-            "jsonrpc": "2.0", "method": "call",
-            "params": {
-                "service": "object", "method": "execute_kw",
-                "args": [ODOO_DB, await _uid(client), ODOO_PASSWORD, model, method, args, kwargs or {}]
+    try:
+        async with httpx.AsyncClient(timeout=ODOO_TIMEOUT) as client:
+            payload = {
+                "jsonrpc": "2.0", "method": "call",
+                "params": {
+                    "service": "object", "method": "execute_kw",
+                    "args": [ODOO_DB, await _uid(client), ODOO_PASSWORD, model, method, args, kwargs or {}]
+                }
             }
-        }
-        r = await client.post(ODOO_URL + "/jsonrpc", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            raise Exception(data["error"].get("data", {}).get("message", "Error Odoo"))
-        return data["result"]
+            r = await client.post(ODOO_URL + "/jsonrpc", json=payload)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.TimeoutException:
+        raise Exception("Odoo no respondio a tiempo. Intenta de nuevo en un momento.")
+    if "error" in data:
+        msg = data["error"].get("data", {}).get("message", "Error Odoo")
+        # La sesion/uid guardado puede haber caducado (cambio de clave, reinicio de Odoo): se vuelve a autenticar una vez.
+        if _reintento and ("access" in msg.lower() or "denied" in msg.lower() or "session" in msg.lower()):
+            _uid_cache.clear()
+            return await _rpc(model, method, args, kwargs, _reintento=False)
+        raise Exception(msg)
+    return data["result"]
 
 _uid_cache = {}
 async def _uid(client: httpx.AsyncClient):
@@ -114,38 +123,110 @@ def _detectar_sucursal_raiker(nombre_contacto: str) -> str:
     return ""
 
 
+# ───────────────────────── lectura de movimientos (Odoo v19) ─────────────────────────
+def _clave_desc(nombre: str):
+    match = re.match(r"^\[([^\]]+)\]", nombre or "")
+    clave = match.group(1).strip() if match else (nombre or "").split(" ")[0]
+    desc = nombre.replace(match.group(0), "").strip() if match else (nombre or "")
+    return clave, desc
+
+
+async def _campos_move() -> list:
+    """Campos de stock.move que existan en ESTA base (v16 usa quantity_done; v17+ usa quantity)."""
+    mf = await _fields("stock.move")
+    base = ["product_id", "product_uom_qty", "state", "picking_id", "name"]
+    if not mf:
+        return base + ["quantity"]
+    return base + [c for c in ("quantity", "quantity_done", "product_qty") if c in mf]
+
+
+def _cantidad_move(m: dict):
+    """Piezas del movimiento, en la unidad del PRODUCTO (no la del movimiento: una 'Docena' no es 1 pieza).
+    Movimiento hecho -> lo realmente entregado; cualquier otro estado -> la demanda. Cancelado -> 0."""
+    st = m.get("state")
+    if st == "cancel":
+        return 0.0
+    uom_q = float(m.get("product_uom_qty") or 0)
+    prod_q = m.get("product_qty")
+    prod_q = float(prod_q) if prod_q not in (None, False) else None
+    if st == "done":
+        hecho = m.get("quantity")
+        if hecho in (None, False):
+            hecho = m.get("quantity_done") or 0
+        hecho = float(hecho or 0)
+        if prod_q is not None and uom_q:
+            hecho *= prod_q / uom_q
+        return hecho
+    return prod_q if prod_q is not None else uom_q
+
+
+async def _productos_de_moves(moves: list, avisos: list) -> list:
+    """Agrupa por producto (un mismo SKU en varios renglones se suma), usa default_code real y redondea avisando."""
+    ids = sorted({m["product_id"][0] for m in moves if m.get("product_id")})
+    codigos = {}
+    if ids:
+        try:
+            for p in await _rpc("product.product", "read", [ids], {"fields": ["default_code", "name"], "context": {"active_test": False}}):
+                codigos[p["id"]] = ((p.get("default_code") or "").strip(), p.get("name") or "")
+        except Exception:
+            codigos = {}
+    acum, orden = {}, []
+    for m in moves:
+        q = _cantidad_move(m)
+        if q <= 0:
+            continue
+        pid = m["product_id"][0] if m.get("product_id") else None
+        disp = m["product_id"][1] if m.get("product_id") else (m.get("name") or "")
+        cod, nom = codigos.get(pid, ("", ""))
+        if cod:
+            clave, desc = cod, (nom or _clave_desc(disp)[1])
+        else:
+            clave, desc = _clave_desc(disp)
+        if not clave:
+            avisos.append(f"Un renglon sin codigo interno ({disp[:40]}) se omitio.")
+            continue
+        if clave not in acum:
+            acum[clave] = {"clave": clave, "descripcion": desc, "q": 0.0}
+            orden.append(clave)
+        acum[clave]["q"] += q
+    out = []
+    for c in orden:
+        a = acum[c]
+        if abs(a["q"] - round(a["q"])) > 0.001:
+            avisos.append(f"{c}: cantidad fraccionaria ({a['q']:g}); se redondeo a {round(a['q'])}.")
+        n = round(a["q"])
+        if n > 0:
+            out.append({"clave": c, "descripcion": a["descripcion"], "cantidad_total": n, "unidad": "PZA"})
+    return out
+
+
 async def cargar_entrega(picking_ids: list):
-    picks = await _rpc("stock.picking", "search_read",
-        [[["id", "in", picking_ids]]],
-        {"fields": ["name", "partner_id", "sale_id", "move_ids", "state"]}
-    )
+    """Entrega(s) de salida de una OV. Una OV puede traer varios 'pickings' (pick/pack/out de rutas de varios pasos,
+    devoluciones, remanentes, cancelados): solo cuentan las SALIDAS a cliente no canceladas, y si hay mas de una
+    (entrega + remanente) se suman. Los avisos explican cualquier decision."""
+    avisos = []
+    pf = await _fields("stock.picking")
+    campos = ["name", "partner_id", "sale_id", "move_ids", "state"] + [c for c in ("picking_type_code", "origin") if c in pf or not pf]
+    picks = await _rpc("stock.picking", "search_read", [[["id", "in", picking_ids]]], {"fields": campos, "order": "id"})
     if not picks:
         raise Exception("La OV no tiene entregas")
-    p = picks[0]
-    validada = p.get("state") == "done"
-    moves = await _rpc("stock.move", "search_read",
-        [[["id", "in", p["move_ids"]]]],
-        {"fields": ["product_id", "product_uom_qty", "quantity"]}
-    )
-    productos = []
-    for m in moves:
-        # Si la entrega ya esta validada ("Hecho"), usamos la cantidad REAL
-        # que se surtio (campo "quantity") — no lo que se pidio originalmente
-        # ("product_uom_qty"/Demanda). Asi los productos que no se pudieron
-        # surtir (faltante de stock, etc.) no salen en las etiquetas.
-        # Si todavia no esta validada, no hay cantidad real aun, usamos la
-        # demanda como respaldo (comportamiento anterior).
-        cantidad = m.get("quantity", 0) if validada else m.get("product_uom_qty", 0)
-        if cantidad <= 0:
-            continue
-        nombre = m["product_id"][1] if m.get("product_id") else (m.get("name") or "")
-        match = re.match(r"^\[([^\]]+)\]", nombre)
-        clave = match.group(1).strip() if match else nombre.split(" ")[0]
-        desc  = nombre.replace(match.group(0), "").strip() if match else nombre
-        productos.append({
-            "clave": clave, "descripcion": desc,
-            "cantidad_total": round(cantidad), "unidad": "PZA"
-        })
+    vivos = [x for x in picks if x.get("state") != "cancel"]
+    if not vivos:
+        raise Exception("Todas las entregas de esta OV estan canceladas.")
+    salidas = [x for x in vivos if x.get("picking_type_code") == "outgoing"]
+    if not salidas:
+        salidas = [x for x in vivos if x.get("picking_type_code") not in ("incoming", "internal")] or vivos
+        avisos.append("No se encontro una salida a cliente; se usaron las operaciones disponibles de la OV.")
+    if len(salidas) > 1:
+        avisos.append("La OV tiene " + str(len(salidas)) + " salidas (" + ", ".join(x["name"] for x in salidas) + "); se sumaron sus cantidades.")
+    p = salidas[0]
+    mids = sorted({i for x in salidas for i in (x.get("move_ids") or [])})
+    moves = await _rpc("stock.move", "search_read", [[["id", "in", mids]]], {"fields": await _campos_move(), "context": {"active_test": False}}) if mids else []
+    productos = await _productos_de_moves(moves, avisos)
+    if not productos:
+        raise Exception("La entrega no tiene piezas por enviar (todo cancelado o en cero).")
+    if any(x.get("state") not in ("done",) for x in salidas):
+        avisos.append("La entrega aun no esta validada en Odoo: las cantidades son la DEMANDA, no lo entregado.")
 
     # Direccion de entrega real: viene del campo "partner_shipping_id" de la
     # orden de venta (Odoo estandar), no del cliente general de la OV.
@@ -186,8 +267,10 @@ async def cargar_entrega(picking_ids: list):
         "sucursal": sucursal_detectada,
         "comercializador": PARTNER_MAP.get(p["partner_id"][0] if p.get("partner_id") else None, ""),
         "fuente": "odoo",
-        "productos": productos
+        "productos": productos,
+        "avisos": avisos,
     }
+
 
 # ── TRASPASOS INTERNOS (CEDIS, FULL MELI, Eventos y Expo) ────────
 def _frag(x):
@@ -308,31 +391,18 @@ async def buscar_almacenes(nombre: str = ""):
 async def cargar_traspaso(picking_id: int):
     picks = await _rpc("stock.picking", "search_read",
         [[["id", "=", picking_id]]],
-        {"fields": ["name", "location_id", "location_dest_id", "move_ids"]}
+        {"fields": ["name", "location_id", "location_dest_id", "move_ids", "state"]}
     )
     if not picks:
         raise Exception("Traspaso no encontrado")
     p = picks[0]
-    moves = await _rpc("stock.move", "search_read",
-        [[["id", "in", p["move_ids"]]]],
-        {"fields": ["product_id", "product_uom_qty"]}
-    )
+    avisos = []
+    moves = await _rpc("stock.move", "search_read", [[["id", "in", p["move_ids"]]]], {"fields": await _campos_move()}) if p.get("move_ids") else []
+    productos = await _productos_de_moves(moves, avisos)
+    if not productos:
+        raise Exception("El traspaso no tiene piezas (todo cancelado o en cero).")
     origen  = p["location_id"][1] if p.get("location_id") else ""
     destino = p["location_dest_id"][1] if p.get("location_dest_id") else ""
-
-    productos = []
-    for m in moves:
-        if m["product_uom_qty"] <= 0:
-            continue
-        nombre = m["product_id"][1] if m.get("product_id") else (m.get("name") or "")
-        match = re.match(r"^\[([^\]]+)\]", nombre)
-        clave = match.group(1).strip() if match else nombre.split(" ")[0]
-        desc  = nombre.replace(match.group(0), "").strip() if match else nombre
-        productos.append({
-            "clave": clave, "descripcion": desc,
-            "cantidad_total": round(m["product_uom_qty"]), "unidad": "PZA"
-        })
-
     folio_limpio = re.sub(r"[^A-Z0-9]+", "-", p["name"].upper()).strip("-")
     return {
         "num_entrega":     f"TRASPASO-{folio_limpio}",
@@ -342,7 +412,8 @@ async def cargar_traspaso(picking_id: int):
         "sucursal":        destino,
         "comercializador": "ECOR",
         "fuente":          "odoo",
-        "productos":       productos
+        "productos":       productos,
+        "avisos":          avisos,
     }
 
 # ── PRODUCTOS COMERCIALIZABLES (para asignar ubicacion en el almacen) ──
@@ -351,7 +422,10 @@ async def buscar_productos_venta(termino: str = "", limite: int = 50):
     poder asignarles despues una ubicacion fisica en el mapa del CEDIS.
     Solo se muestran productos con la etiqueta "Maquinaria" (product_tag_ids),
     ya que este almacen es especificamente para ese tipo de producto."""
-    dominio = [["sale_ok", "=", True], ["product_tag_ids.name", "=", "Maquinaria"]]
+    dominio = [["sale_ok", "=", True]]
+    etq = os.getenv("INVENTARIO_ETIQUETA", "Maquinaria").strip().strip("\"'")
+    if etq and etq.upper() not in ("TODOS", "TODAS", "NINGUNA", "NO", "-"):
+        dominio.append(["product_tag_ids.name", "=", etq])
     if termino:
         t = termino.strip()
         dominio.append("|")
@@ -510,3 +584,38 @@ async def leer_catalogo_odoo(skus: list) -> dict:
     for s in skus:
         out.setdefault(s, {"encontrado": False})
     return out
+
+
+# ── DIAGNOSTICO v19: que campos usa la plataforma y si existen en ESTA base ──
+_CAMPOS_USADOS = {
+    "stock.picking": ["name", "partner_id", "sale_id", "move_ids", "state", "picking_type_code", "origin", "location_id", "location_dest_id", "scheduled_date"],
+    "stock.move": ["product_id", "product_uom_qty", "product_qty", "product_uom", "quantity", "state", "picking_id"],
+    "stock.move.line": ["date", "product_id", "location_id", "location_dest_id", "quantity", "picking_id", "reference", "state"],
+    "stock.quant": ["product_id", "location_id", "quantity", "reserved_quantity"],
+    "stock.location": ["barcode", "usage", "complete_name", "warehouse_id"],
+    "stock.warehouse": ["name", "code", "view_location_id", "lot_stock_id"],
+    "product.product": ["default_code", "name", "qty_available", "product_tag_ids", "sale_ok", "weight", "volume"],
+    "sale.order": ["name", "partner_id", "state", "picking_ids", "date_order", "warehouse_id", "partner_shipping_id"],
+}
+
+
+async def diagnostico_v19() -> dict:
+    """Revisa, solo en lectura, que modelos y campos que usa la plataforma existan en esta version de Odoo."""
+    res, faltan = {}, []
+    for modelo, campos in _CAMPOS_USADOS.items():
+        f = await _fields(modelo)
+        if not f:
+            res[modelo] = {"modelo": False}
+            faltan.append(modelo)
+            continue
+        r = {c: (c in f) for c in campos}
+        res[modelo] = r
+        faltan += [f"{modelo}.{c}" for c, ok in r.items() if not ok]
+    version = None
+    try:
+        async with httpx.AsyncClient(timeout=ODOO_TIMEOUT) as client:
+            v = await client.post(ODOO_URL + "/jsonrpc", json={"jsonrpc": "2.0", "method": "call", "params": {"service": "common", "method": "version", "args": []}})
+            version = (v.json().get("result") or {}).get("server_version")
+    except Exception:
+        pass
+    return {"version_odoo": version, "faltantes": faltan, "ok": not faltan, "detalle": res}
